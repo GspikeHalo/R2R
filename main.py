@@ -35,6 +35,7 @@ def main(config):
 
     wandb.init(
         project="StarGAN-R2R",
+        name="R2R-3",
         config={
             "g_lr":       solver.g_lr,
             "d_lr":       solver.d_lr,

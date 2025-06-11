@@ -1,4 +1,5 @@
 from model import Generator
+from generator import Conformer
 from model import Discriminator
 from torch.autograd import Variable
 from torchvision.utils import save_image
@@ -74,7 +75,8 @@ class Solver(object):
     def build_model(self):
         """Create a generator and a discriminator."""
         # g_conv_dim 第一层卷积通道数， g_repeat_num 残差块重复次数
-        self.G = Generator(self.g_conv_dim, self.c_dim, self.g_repeat_num)
+        # self.G = Generator(self.g_conv_dim, self.c_dim, self.g_repeat_num)
+        self.G = Conformer()
         self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim, self.d_repeat_num)
 
         self.g_optimizer = torch.optim.Adam(self.G.parameters(), self.g_lr, [self.beta1, self.beta2])
@@ -262,7 +264,7 @@ class Solver(object):
                 g_loss_rec = torch.mean(torch.abs(x_real - x_reconst))
 
                 # Backward and optimize.
-                g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_cls
+                g_loss = 3 * g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_cls * g_loss_cls  # changed the parameter of g_loss_fake from 1 -> 3
                 self.reset_grad()
                 g_loss.backward()
                 self.g_optimizer.step()

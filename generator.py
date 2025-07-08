@@ -328,20 +328,27 @@ class ConvTransBlock(nn.Module):
         return x, x_t
 
 class FiLMGenerator(nn.Module):
-    def __init__(self, c_dim, film_channels, hidden_dim=128):
+    def __init__(self, c_dim, film_channels, hidden_dims=[256, 256], dropout=0.2):
         super().__init__()
-        self.nets = nn.ModuleDict({
-            name: nn.Sequential(
-                nn.Linear(c_dim, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, 2 * C)
-            ) for name, C in film_channels.items()
-        })
+        self.nets=nn.ModuleDict()
+        for name, C in film_channels.items():
+            layers, in_dim = [], c_dim
+            for h in hidden_dims:
+                layers += [
+                    nn.Linear(in_dim, h),
+                    nn.ReLU(inplace=True),
+                    nn.LayerNorm(h),
+                    nn.Dropout(dropout),
+                ]
+                in_dim = h
+            layers += [nn.Linear(in_dim, 2 * C)]
+            self.nets[name] = nn.Sequential(*layers)
+
     def forward(self, z):
         params = {}
         for name, net in self.nets.items():
-            gamma_beta = net(z)  # [B, 2*C]
-            gamma, beta = gamma_beta.chunk(2, dim=1)
+            gamma_beta = net(z)
+            gamma, beta = gamma_beta.chunk(2, dim=-1)
             params[name] = (gamma, beta)
         return params
 

@@ -347,180 +347,170 @@ class FiLMGenerator(nn.Module):
 
 # class FiLMTransformer(nn.Module):
 #     """
-#     Cross‐Attention–based FiLM parameter generator.
-
-#     Generates `num_pairs` of (γ, β) pairs of size `embed_dim` each,
-#     conditioned on `target_label` and image feature embeddings.
+#     Cross-Attention–based FiLM parameter generator with:
+#       1) conditional + global queries,
+#       2) convolutional downsampling for richer KV features,
+#       3) robust handling of both 3D tokens and 4D feature maps.
 #     """
-#     def __init__(self,
-#                  embed_dim: int,
-#                  c_dim: int,
-#                  num_pairs: int = 1,
-#                  num_heads: int = 4,
-#                  mlp_ratio: int = 4):
+#     def __init__(
+#         self,
+#         embed_dim: int,
+#         c_dim: int,
+#         num_pairs: int = 1,
+#         num_heads: int = 4,
+#         mlp_ratio: float = 4.0
+#     ):
 #         super().__init__()
-#         self.embed_dim  = embed_dim
-#         self.c_dim      = c_dim
-#         self.num_pairs  = num_pairs
-#         hidden_dim = int(embed_dim * mlp_ratio)
-
-
-#         # Project condition vector → num_pairs queries of dimension embed_dim
+#         self.embed_dim = embed_dim
+#         self.c_dim = c_dim
+#         self.num_pairs = num_pairs
+#
+#         # 1) Project condition → [B, num_pairs * embed_dim]
 #         self.cond_proj = nn.Linear(c_dim, embed_dim * num_pairs)
-
-#         # Project feature embeddings → keys & values of dimension embed_dim
-#         self.key_proj   = nn.Linear(embed_dim, embed_dim)
-#         self.val_proj   = nn.Linear(embed_dim, embed_dim)
-
-#         # Cross‐attention: queries from cond, keys/values from features
-#         self.cross_attn = nn.MultiheadAttention(embed_dim=embed_dim,
-#                                                 num_heads=num_heads,
-#                                                 batch_first=True)
-
-#         # MLP to map each attended vector → 2 × embed_dim (γ + β)
+#         # Learnable global queries bias
+#         self.global_q = nn.Parameter(torch.randn(1, num_pairs, embed_dim))
+#
+#         # 2) Convolutional downsampling for KV: [B, D, H, W] → [B, D, H, W]
+#         self.kv_downsample = nn.Sequential(
+#             nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=1, padding=1),
+#             nn.BatchNorm2d(embed_dim),
+#             nn.GELU(),
+#             nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=1, padding=1),
+#             nn.BatchNorm2d(embed_dim),
+#             nn.GELU(),
+#             nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=1, padding=1),
+#             nn.BatchNorm2d(embed_dim),
+#         )
+#
+#         # 3) Project feature tokens → keys & values
+#         self.key_proj = nn.Linear(embed_dim, embed_dim)
+#         self.val_proj = nn.Linear(embed_dim, embed_dim)
+#
+#         # 4) Cross-attention
+#         self.cross_attn = nn.MultiheadAttention(
+#             embed_dim=embed_dim,
+#             num_heads=num_heads,
+#             batch_first=True
+#         )
+#
+#         # 5) MLP to map attended vectors → 2*embed_dim
+#         hidden_dim = int(embed_dim * mlp_ratio)
 #         self.mlp = nn.Sequential(
 #             nn.Linear(embed_dim, hidden_dim),
 #             nn.ReLU(inplace=True),
 #             nn.Linear(hidden_dim, 2 * embed_dim)
 #         )
-
-#     def forward(self,
-#                 feat_embs: torch.Tensor,
-#                 target_label: torch.Tensor
-#                ) -> (torch.Tensor, torch.Tensor):
+#
+#     def forward(
+#         self,
+#         feat_embs: torch.Tensor,           # [B, L, D] tokens or [B, D, H, W] feature map
+#         target_label: torch.Tensor         # [B, c_dim]
+#     ):
 #         """
 #         Args:
-#           feat_embs:    [B, L, embed_dim]  — patch/feature embeddings
-#           target_label: [B, c_dim]         — one‐hot or embedding
-
+#           feat_embs:    3D tokens [B, L, D] or 4D map [B, D, H, W]
+#           target_label: [B, c_dim]
 #         Returns:
-#           gammas: [B, num_pairs, embed_dim]
-#           betas:  [B, num_pairs, embed_dim]
+#           gammas, betas each [B, num_pairs, D]
 #         """
-#         B, L, D = feat_embs.shape
-#         assert D == self.embed_dim
+#         # ==== Prepare tokens ====
+#         if feat_embs.ndim == 4:
+#             # conv downsample then flatten
+#             x = self.kv_downsample(feat_embs)  # [B, D, H', W']
+#             B, D, H2, W2 = x.shape
+#             feat_tokens = x.flatten(2).transpose(1, 2)  # [B, N, D]
+#         elif feat_embs.ndim == 3:
+#             feat_tokens = feat_embs
+#             B, _, D = feat_tokens.shape
+#         else:
+#             raise ValueError(f"Unsupported feat_embs ndim={feat_embs.ndim}")
+#
+#         # ==== Dim checks ====
+#         assert D == self.embed_dim, f"embed_dim mismatch: got {D}"
 #         assert target_label.shape[1] == self.c_dim
-
-#         # 1) build per‐pair queries from the condition
-#         #    → [B, num_pairs * embed_dim] → [B, num_pairs, embed_dim]
-#         Q = self.cond_proj(target_label).view(B, self.num_pairs, D)
-
-#         # 2) project features → Keys and Values
-#         K = self.key_proj(feat_embs)  # [B, L, embed_dim]
-#         V = self.val_proj(feat_embs)  # [B, L, embed_dim]
-
-#         # 3) cross‐attention
-#         attn_out, _ = self.cross_attn(query=Q, key=K, value=V)
-#         # attn_out: [B, num_pairs, embed_dim]
-
-#         # 4) feed through MLP to get 2*embed_dim per query
-#         flat = attn_out.reshape(B * self.num_pairs, D)      # [B*num_pairs, embed_dim]
-#         out  = self.mlp(flat)                               # [B*num_pairs, 2*embed_dim]
-#         out  = out.view(B, self.num_pairs, 2 * D)           # [B, num_pairs, 2*embed_dim]
-
-#         # 5) split into gammas and betas
-#         gammas, betas = out.chunk(2, dim=2)                 # each [B, num_pairs, embed_dim]
+#
+#         # ==== Build queries ====
+#         cond_q = self.cond_proj(target_label).view(B, self.num_pairs, D)
+#         Q = cond_q + self.global_q  # [B, num_pairs, D]
+#
+#         # ==== Generate Key/Value ====
+#         K = self.key_proj(feat_tokens)  # [B, N, D]
+#         V = self.val_proj(feat_tokens)
+#
+#         # ==== Cross-attention ====
+#         attn_out, _ = self.cross_attn(query=Q, key=K, value=V)  # [B, num_pairs, D]
+#
+#         # ==== MLP and split ====
+#         flat = attn_out.reshape(B * self.num_pairs, D)
+#         out  = self.mlp(flat).view(B, self.num_pairs, 2 * D)
+#         gammas, betas = out.chunk(2, dim=2)  # each [B, num_pairs, D]
+#
 #         return gammas, betas
-class FiLMTransformer(nn.Module):
-    """
-    Cross-Attention–based FiLM parameter generator with:
-      1) conditional + global queries,
-      2) convolutional downsampling for richer KV features,
-      3) robust handling of both 3D tokens and 4D feature maps.
-    """
-    def __init__(
-        self,
-        embed_dim: int,
-        c_dim: int,
-        num_pairs: int = 1,
-        num_heads: int = 4,
-        mlp_ratio: float = 4.0
-    ):
+class FiLMTransformerMulti(nn.Module):
+    def __init__(self, embed_dim, c_dim, num_pairs, num_heads, mlp_ratio):
         super().__init__()
         self.embed_dim = embed_dim
-        self.c_dim = c_dim
+        self.c_dim     = c_dim
         self.num_pairs = num_pairs
 
-        # 1) Project condition → [B, num_pairs * embed_dim]
         self.cond_proj = nn.Linear(c_dim, embed_dim * num_pairs)
-        # Learnable global queries bias
-        self.global_q = nn.Parameter(torch.randn(1, num_pairs, embed_dim))
+        self.global_q  = nn.Parameter(torch.randn(1, num_pairs, embed_dim))
 
-        # 2) Convolutional downsampling for KV: [B, D, H, W] → [B, D, H, W]
         self.kv_downsample = nn.Sequential(
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(embed_dim),
             nn.GELU(),
             nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(embed_dim),
             nn.GELU(),
-            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(embed_dim),
         )
 
-        # 3) Project feature tokens → keys & values
         self.key_proj = nn.Linear(embed_dim, embed_dim)
-        self.val_proj = nn.Linear(embed_dim, embed_dim)
+        self.val_proj = nn.Linear(embed_dim, embed_dim)  # ← 准备好 val_proj
 
-        # 4) Cross-attention
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            batch_first=True
-        )
+        self.cross_attn = nn.ModuleList([
+            nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
+            for _ in range(num_pairs)
+        ])
 
-        # 5) MLP to map attended vectors → 2*embed_dim
         hidden_dim = int(embed_dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 2 * embed_dim)
-        )
+        self.mlp = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(embed_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, 2 * embed_dim),
+            )
+            for _ in range(num_pairs)
+        ])
 
-    def forward(
-        self,
-        feat_embs: torch.Tensor,           # [B, L, D] tokens or [B, D, H, W] feature map
-        target_label: torch.Tensor         # [B, c_dim]
-    ):
-        """
-        Args:
-          feat_embs:    3D tokens [B, L, D] or 4D map [B, D, H, W]
-          target_label: [B, c_dim]
-        Returns:
-          gammas, betas each [B, num_pairs, D]
-        """
-        # ==== Prepare tokens ====
-        if feat_embs.ndim == 4:
-            # conv downsample then flatten
-            x = self.kv_downsample(feat_embs)  # [B, D, H', W']
-            B, D, H2, W2 = x.shape
-            feat_tokens = x.flatten(2).transpose(1, 2)  # [B, N, D]
-        elif feat_embs.ndim == 3:
-            feat_tokens = feat_embs
-            B, _, D = feat_tokens.shape
-        else:
-            raise ValueError(f"Unsupported feat_embs ndim={feat_embs.ndim}")
+    def forward(self, feat_embs, target_label):
+        B = target_label.size(0)
 
-        # ==== Dim checks ====
-        assert D == self.embed_dim, f"embed_dim mismatch: got {D}"
-        assert target_label.shape[1] == self.c_dim
+        x = self.kv_downsample(feat_embs)
+        feat_tokens = x.flatten(2).transpose(1, 2)
 
-        # ==== Build queries ====
+        D = self.embed_dim
         cond_q = self.cond_proj(target_label).view(B, self.num_pairs, D)
-        Q = cond_q + self.global_q  # [B, num_pairs, D]
+        Q_all  = cond_q + self.global_q
 
-        # ==== Generate Key/Value ====
-        K = self.key_proj(feat_tokens)  # [B, N, D]
+        K = self.key_proj(feat_tokens)
         V = self.val_proj(feat_tokens)
 
-        # ==== Cross-attention ====
-        attn_out, _ = self.cross_attn(query=Q, key=K, value=V)  # [B, num_pairs, D]
+        gammas = []
+        betas  = []
+        for i in range(self.num_pairs):
+            Q_i = Q_all[:, i:i+1, :]
+            attn_out, _ = self.cross_attn[i](Q_i, K, V)
+            flat       = attn_out.squeeze(1)
+            g_b        = self.mlp[i](flat)
+            gamma_i, beta_i = g_b.chunk(2, dim=-1)
+            gammas.append(gamma_i.unsqueeze(1))
+            betas .append(beta_i.unsqueeze(1))
 
-        # ==== MLP and split ====
-        flat = attn_out.reshape(B * self.num_pairs, D)
-        out  = self.mlp(flat).view(B, self.num_pairs, 2 * D)
-        gammas, betas = out.chunk(2, dim=2)  # each [B, num_pairs, D]
-
+        gammas = torch.cat(gammas, dim=1)
+        betas  = torch.cat(betas,  dim=1)
         return gammas, betas
 
 class Conformer(nn.Module):
@@ -656,14 +646,7 @@ class Conformer(nn.Module):
                     if freeze_generator:
                         module.requires_grad_(False)
 
-        # film_channels = {
-        #     'stem': 64,
-        #     'stage1': stage_1_channel,     # Apply at beginning of stage 1
-        #     'stage2': stage_2_channel,     # Apply at beginning of stage 2
-        #     'stage3': stage_3_channel,     # Apply at beginning of stage 3
-        # }
-
-        self.film_xattn = FiLMTransformer(
+        self.film_xattn = FiLMTransformerMulti(
             embed_dim=embed_dim,
             c_dim=c_dim,
             num_pairs=2,
@@ -694,31 +677,20 @@ class Conformer(nn.Module):
     def forward(self, x, target_label):
         B,C,H,W = x.shape
         x_poly = x
-        # film = self.film_gen(target_label)
-
-        # label_map = target_label.view(B, self.c_dim, 1, 1).expand(-1, -1, H, W)  # [B, c_dim, H, W]
-        # x_cond = torch.cat([x, label_map], dim=1) # [B, 4+c_dim, H, W]
 
         x_pad = pad_image(x, 32*self.down_scale_times)
         x_down = F.interpolate(x_pad,mode='bilinear',scale_factor=1.0/self.down_scale_times)
 
         # stem stage [N, 3, 224, 224] -> [N, 64, 56, 56]
-        # x_base = self.maxpool(self.act1(self.bn1(self.conv1(x_down)))) # [B, 64, H/4, H/4]
         x = self.conv1(x_down)        # [B, 64, H/2, W/2]
         x = self.bn1(x)               # 归一化
-
-        # FiLM 条件化：γ·x + β
-        # gamma, beta = film['stem']    # film['stem'] 是 [B, 64] 的 γ,β
-        # x = gamma.view(B, 64, 1, 1) * x + beta.view(B, 64, 1, 1)
         x = self.act1(x)
         x_base = self.maxpool(x)      # [B, 64, H/4, W/4]
 
         # 1 stage
-        # gamma_s1, beta_s1 = film['stage1']
         x_feat = self.conv_1(x_base, return_x_2=False)
 
         # [batch_size, patch_nums,embed_dim]
-        # x_t = self.trans_patch_conv(x_base).flatten(2).transpose(1, 2)
         feat_map = self.trans_patch_conv(x_base)
         gammas, betas = self.film_xattn(feat_map, target_label)
         gamma_t1, beta_t1 = gammas[:,0], betas[:,0]

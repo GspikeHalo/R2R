@@ -31,24 +31,38 @@ def main(config):
         config.num_workers
     )
 
-    solver = Solver(mydata_loader, None, config)
+    if config.mode != 'test':
+        test_loader = get_loader(
+            config.test_dataset,
+            config.mydata_attr_path,
+            config.selected_attrs,
+            config.mydata_crop_size,
+            config.image_size,
+            batch_size=1,
+            mode='test',
+            num_workers=config.num_workers
+        )
+    else:
+        test_loader = None
 
-    wandb.init(
-        project="StarGAN-R2R",
-        name="R2R-3",
-        config={
-            "g_lr":       solver.g_lr,
-            "d_lr":       solver.d_lr,
-            "batch_size": solver.batch_size,
-            "num_iters":  solver.num_iters,
-            "lambda_cls": solver.lambda_cls,
-            "lambda_rec": solver.lambda_rec,
-            "lambda_gp":  solver.lambda_gp,
-            "n_critic":   solver.n_critic,
-        }
-    )
+    solver = Solver(mydata_loader, test_loader, config)
 
     if config.mode == 'train':
+        wandb.init(
+            project="StarGAN-R2R",
+            name="R2R-4-3",
+            config={
+                "g_lr":       solver.g_lr,
+                "d_lr":       solver.d_lr,
+                "batch_size": solver.batch_size,
+                "num_iters":  solver.num_iters,
+                "lambda_cls": solver.lambda_cls,
+                "lambda_rec": solver.lambda_rec,
+                "lambda_gp":  solver.lambda_gp,
+                "lambda_id": solver.lambda_id,
+                "n_critic":   solver.n_critic,
+            }
+        )
         solver.train()
     else:
         solver.test()
@@ -77,11 +91,13 @@ if __name__ == '__main__':
                         help='weight for reconstruction loss')
     parser.add_argument('--lambda_gp', type=float, default=10,
                         help='weight for gradient penalty')
+    parser.add_argument('--lambda_id', type=float, default=5.0,
+                    help='weight for identity loss')
 
     # Training configuration
     parser.add_argument('--batch_size', type=int, default=16,
                         help='mini-batch size')
-    parser.add_argument('--num_iters', type=int, default=200000,
+    parser.add_argument('--num_iters', type=int, default=400000,
                         help='total iterations for training D')
     parser.add_argument('--num_iters_decay', type=int, default=100000,
                         help='iterations to start decaying learning rate')
@@ -121,6 +137,7 @@ if __name__ == '__main__':
     parser.add_argument('--mydata_attr_path', type=str,
                         default='data/mydata/list_attr_mydata.txt',
                         help='path to MyData attribute file')
+    parser.add_argument('--test_dataset', type=str, default='data/mydata/list_attr_mydata.txt', help='test')
     parser.add_argument('--log_dir', type=str, default='mydata/logs',
                         help='directory to save training logs')
     parser.add_argument('--model_save_dir', type=str, default='mydata/models',
@@ -139,6 +156,8 @@ if __name__ == '__main__':
                         help='interval for saving model checkpoints')
     parser.add_argument('--lr_update_step', type=int, default=1000,
                         help='interval for updating learning rate')
+    parser.add_argument('--eval_step', type=int, default=5000,
+                        help='interval for evaluating model')
 
     config = parser.parse_args()
     print(config)

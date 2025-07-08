@@ -8,8 +8,10 @@ import random
 import numpy as np
 import torch.nn.functional as F
 
+
 class MyData(data.Dataset):
     """Dataset class for the custom 4-channel .npy dataset."""
+
     def __init__(self, image_dir, attr_path, selected_attrs, mode, crop_size=178, image_size=128):
         """Initialize and preprocess the custom dataset."""
         self.image_dir = image_dir
@@ -47,7 +49,7 @@ class MyData(data.Dataset):
                 split = line.split()
                 filename = split[0]
                 values = split[1:]
-                label = [] # 保存的是一行中的attr的true or false
+                label = []  # 保存的是一行中的attr的true or false
                 for attr_name in self.selected_attrs:
                     idx = self.attr2idx[attr_name]
                     label.append(values[idx] == '1')  # True for '1', False for '-1'
@@ -102,14 +104,14 @@ class MyData(data.Dataset):
             img0 = self._process(arr0)
             img1 = self._process(arr1)
             return img0, img1, c0, c1, p0, p1
-    
+
     def _process(self, img):
         # img: [C,H,W]
         C, H, W = img.shape
         # 中心裁剪
         if H >= self.crop_size and W >= self.crop_size:
             cy, cx = (H - self.crop_size) // 2, (W - self.crop_size) // 2
-            img = img[:, cy:cy+self.crop_size, cx:cx+self.crop_size]
+            img = img[:, cy:cy + self.crop_size, cx:cx + self.crop_size]
         # 调整大小
         if img.shape[1] != self.image_size or img.shape[2] != self.image_size:
             t = torch.from_numpy(img).unsqueeze(0)
@@ -120,9 +122,9 @@ class MyData(data.Dataset):
         img_t = torch.from_numpy(img) * 2.0 - 1.0
         return img_t
 
-
     def __len__(self):
         return self.num_images
+
 
 def get_loader(image_dir, attr_path, selected_attrs, crop_size=256, image_size=256,
                batch_size=16, mode='train', num_workers=1):

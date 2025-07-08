@@ -11,7 +11,6 @@ from utils import pad_image
 import time
 import torch.utils.benchmark as benchmark
 
-
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -22,7 +21,7 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
-    def forward(self, x):
+    def forward(self, x, film_params=None):
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
@@ -73,10 +72,22 @@ class Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+    def forward(self, x, film_params=None):
+        x1 = self.norm1(x)
+        if film_params is not None:
+            gamma, beta = film_params
+            x1 = gamma.unsqueeze(1) * x1 + beta.unsqueeze(1)
+        x = x + self.drop_path(self.attn(x1))
+
+        # MLP sub-layer
+        x2 = self.norm2(x)
+        if film_params is not None:
+            gamma, beta = film_params
+            x2 = gamma.unsqueeze(1) * x2 + beta.unsqueeze(1)
+        x = x + self.drop_path(self.mlp(x2))
+
         return x
+
 
 
 class ConvBlock(nn.Module):
@@ -112,7 +123,7 @@ class ConvBlock(nn.Module):
     def zero_init_last_bn(self):
         nn.init.zeros_(self.bn3.weight)
 
-    def forward(self, x, x_t=None, return_x_2=True):
+    def forward(self, x, x_t=None, return_x_2=True, film_params=None):
         residual = x
 
         x = self.conv1(x)
@@ -129,6 +140,11 @@ class ConvBlock(nn.Module):
 
         x = self.conv3(x2)
         x = self.bn3(x)
+        if film_params is not None:
+            gamma, beta = film_params
+            B = x.shape[0]
+            x = gamma.view(B, -1, 1, 1) * x + beta.view(B, -1, 1, 1)
+
         if self.drop_block is not None:
             x = self.drop_block(x)
 
@@ -293,14 +309,14 @@ class ConvTransBlock(nn.Module):
         self.num_med_block = num_med_block
         self.last_fusion = last_fusion
 
-    def forward(self, x, x_t):
-        x, x2 = self.cnn_block(x)
+    def forward(self, x, x_t, film_params=None, film_trans=None):
+        x, x2 = self.cnn_block(x, film_params=film_params)
 
         _, _, H, W = x2.shape
 
         x_st = self.squeeze_block(x2, x_t)
 
-        x_t = self.trans_block(x_st + x_t)
+        x_t = self.trans_block(x_st + x_t, film_params=film_trans)
 
         if self.num_med_block > 0:
             for m in self.med_block:
@@ -311,6 +327,23 @@ class ConvTransBlock(nn.Module):
 
         return x, x_t
 
+class FiLMGenerator(nn.Module):
+    def __init__(self, c_dim, film_channels, hidden_dim=128):
+        super().__init__()
+        self.nets = nn.ModuleDict({
+            name: nn.Sequential(
+                nn.Linear(c_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, 2 * C)
+            ) for name, C in film_channels.items()
+        })
+    def forward(self, z):
+        params = {}
+        for name, net in self.nets.items():
+            gamma_beta = net(z)  # [B, 2*C]
+            gamma, beta = gamma_beta.chunk(2, dim=1)
+            params[name] = (gamma, beta)
+        return params
 
 class Conformer(nn.Module):
 
@@ -323,13 +356,31 @@ class Conformer(nn.Module):
         self.down_scale_times = down_scale_times
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         assert depth % 3 == 0
+        stage_depth = depth // 3
+
+        self.stage1_start = 2
+        self.stage1_end = self.stage1_start + stage_depth - 1  # inclusive
+
+        self.stage2_start = self.stage1_end + 1
+        self.stage2_end = self.stage2_start + stage_depth - 1
+
+        self.stage3_start = self.stage2_end + 1
+        self.stage3_end = self.stage3_start + stage_depth - 1
+
+        self.fin_stage = self.stage3_end + 1
 
         self.raw_channels = raw_channels
         self.c_dim = c_dim
-        self.in_channels = raw_channels + c_dim
+        # self.in_channels = raw_channels + c_dim
+        self.in_channels = raw_channels
         self.patch_size = patch_size
 
         self.trans_dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+
+        # film_channels = {
+        #     'stem':       64,
+        #     'trans_norm': embed_dim,
+        # }
 
         # Classifier head
         self.trans_norm = nn.LayerNorm(embed_dim)
@@ -427,7 +478,18 @@ class Conformer(nn.Module):
                     if freeze_generator:
                         module.requires_grad_(False)
 
+        film_channels = {
+            'stem': 64,
+            'stage1': stage_1_channel,     # Apply at beginning of stage 1
+            'stage2': stage_2_channel,     # Apply at beginning of stage 2
+            'stage3': stage_3_channel,     # Apply at beginning of stage 3
+            'stage1_trans': embed_dim,
+            'stage2_trans': embed_dim,
+            'stage3_trans': embed_dim,
+            'trans_norm': embed_dim,
+        }
 
+        self.film_gen = FiLMGenerator(c_dim, film_channels)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -450,36 +512,65 @@ class Conformer(nn.Module):
     def forward(self, x, target_label):
         B,C,H,W = x.shape
         x_poly = x
+        film = self.film_gen(target_label)
 
-        label_map = target_label.view(B, self.c_dim, 1, 1).expand(-1, -1, H, W)  # [B, c_dim, H, W]
-        x_cond = torch.cat([x, label_map], dim=1) # [B, 4+c_dim, H, W]
+        # label_map = target_label.view(B, self.c_dim, 1, 1).expand(-1, -1, H, W)  # [B, c_dim, H, W]
+        # x_cond = torch.cat([x, label_map], dim=1) # [B, 4+c_dim, H, W]
 
-        x_pad = pad_image(x_cond, 32*self.down_scale_times)
+        x_pad = pad_image(x, 32*self.down_scale_times)
         x_down = F.interpolate(x_pad,mode='bilinear',scale_factor=1.0/self.down_scale_times)
+
         # stem stage [N, 3, 224, 224] -> [N, 64, 56, 56]
-        x_base = self.maxpool(self.act1(self.bn1(self.conv1(x_down)))) # [B, 64, H/4, H/4]
+        # x_base = self.maxpool(self.act1(self.bn1(self.conv1(x_down)))) # [B, 64, H/4, H/4]
+        x = self.conv1(x_down)        # [B, 64, H/2, W/2]
+        x = self.bn1(x)               # 归一化
+
+        # FiLM 条件化：γ·x + β
+        gamma, beta = film['stem']    # film['stem'] 是 [B, 64] 的 γ,β
+        x = gamma.view(B, 64, 1, 1) * x + beta.view(B, 64, 1, 1)
+        x = self.act1(x)
+        x_base = self.maxpool(x)      # [B, 64, H/4, W/4]
 
         # 1 stage
-        x_feat = self.conv_1(x_base, return_x_2=False)
+        gamma_s1, beta_s1 = film['stage1']
+        x_feat = self.conv_1(x_base, return_x_2=False, film_params=(gamma_s1, beta_s1))
 
         # [batch_size, patch_nums,embed_dim]
+        gamma1_t, beta1_t = film['stage1_trans']
         x_t = self.trans_patch_conv(x_base).flatten(2).transpose(1, 2)
         # [batch_size, patch_nums+1,embed_dim]
-        x_t = self.trans_1(x_t)
+        x_t = self.trans_1(x_t, film_params=(gamma1_t, beta1_t))
 
         # 2 ~ final
         for i in range(2, self.fin_stage):
-            # x_feat, x_t = eval('self.conv_trans_' + str(i))(x, x_t)
-            x_feat, x_t = eval(f"self.conv_trans_{i}")(x_feat, x_t)
+            if i == self.stage2_start:
+                gamma_s2, beta_s2 = film['stage2']
+                gamma_s2_t, beta_s2_t = film['stage2_trans']
+                x_feat, x_t = getattr(self, f"conv_trans_{i}")(x_feat, x_t, film_params=(gamma_s2, beta_s2), film_trans=(gamma_s2_t, beta_s2_t))
+            # Apply stage 3 FiLM at the beginning of stage 3
+            elif i == self.stage3_start:
+                gamma_s3, beta_s3 = film['stage3']
+                gamma_s3_t, beta_s3_t = film['stage3_trans']
+                x_feat, x_t = getattr(self, f"conv_trans_{i}")(x_feat, x_t, film_params=(gamma_s3, beta_s3), film_trans=(gamma_s3_t, beta_s3_t))
+            else:
+                x_feat, x_t = getattr(self, f"conv_trans_{i}")(x_feat, x_t)
 
 
+        # x_t = self.trans_norm(x_t)
+        # B,patch_num,_ = x_t.size()
+        # # B,patch_num,embed_dim
+        # weight_trans = self.out1(x_t)
+        # weight = weight_trans
+        # image = self.polynomial_transform(x_poly,weight.view(B,patch_num,self.raw_channels,-1)) + x_poly
+        # image = image[:,:,:H,:W]
+        # return image
         x_t = self.trans_norm(x_t)
-        B,patch_num,_ = x_t.size()
-        # B,patch_num,embed_dim
+        gamma_ln, beta_ln = film['trans_norm']  # [B, embed_dim]
+        x_t = gamma_ln.unsqueeze(1) * x_t + beta_ln.unsqueeze(1)
+        B, patch_num, _ = x_t.size()
         weight_trans = self.out1(x_t)
-        weight = weight_trans
-        image = self.polynomial_transform(x_poly,weight.view(B,patch_num,self.raw_channels,-1)) + x_poly
-        image = image[:,:,:H,:W]
+        image = self.polynomial_transform(x_poly, weight_trans.view(B, patch_num, self.raw_channels, -1)) + x_poly
+
         return image
 
     def polynomial_transform(self, x:torch.Tensor, weights:torch.Tensor):

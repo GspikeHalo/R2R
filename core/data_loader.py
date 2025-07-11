@@ -25,8 +25,8 @@ from torchvision.datasets import ImageFolder
 
 
 def listdir(dname):
-    fnames = list(chain(*[list(Path(dname).rglob('*.' + ext))
-                          for ext in ['png', 'jpg', 'jpeg', 'JPG']]))
+    fnames = list(Path(dname).rglob('*.npy'))
+    fnames.sort()
     return fnames
 
 
@@ -39,7 +39,8 @@ class DefaultDataset(data.Dataset):
 
     def __getitem__(self, index):
         fname = self.samples[index]
-        img = Image.open(fname).convert('RGB')
+        arr = np.load(str(fname))
+        img = torch.from_numpy(arr).float()
         if self.transform is not None:
             img = self.transform(img)
         return img
@@ -47,6 +48,30 @@ class DefaultDataset(data.Dataset):
     def __len__(self):
         return len(self.samples)
 
+class NpyFolder(data.Dataset):
+    def __init__(self, root, transform=None):
+        root = Path(root)
+        classes = sorted(p.name for p in root.iterdir() if p.is_dir())
+        self.class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
+        samples = []
+        for cls in classes:
+            cls_dir = root / cls
+            for fn in cls_dir.rglob('*.npy'):
+                samples.append((fn, self.class_to_idx[cls]))
+        self.samples = samples
+        self.targets = [label for _, label in samples]
+        self.transform = transform
+
+    def __getitem__(self, index):
+        path, label = self.samples[index]
+        arr = np.load(str(path))               # shape (4, H, W) or similar
+        img = torch.from_numpy(arr).float()    # convert to float tensor
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+    def __len__(self):
+        return len(self.samples)
 
 class ReferenceDataset(data.Dataset):
     def __init__(self, root, transform=None):
@@ -60,19 +85,21 @@ class ReferenceDataset(data.Dataset):
             class_dir = os.path.join(root, domain)
             cls_fnames = listdir(class_dir)
             fnames += cls_fnames
-            fnames2 += random.sample(cls_fnames, len(cls_fnames))
+            fnames2 += random.sample(cls_fnames, len(cls_fnames)) # disordered sequence
             labels += [idx] * len(cls_fnames)
         return list(zip(fnames, fnames2)), labels
 
     def __getitem__(self, index):
         fname, fname2 = self.samples[index]
         label = self.targets[index]
-        img = Image.open(fname).convert('RGB')
-        img2 = Image.open(fname2).convert('RGB')
+        arr1 = np.load(str(fname))
+        arr2 = np.load(str(fname2))
+        img1 = torch.from_numpy(arr1).float()
+        img2 = torch.from_numpy(arr2).float()
         if self.transform is not None:
-            img = self.transform(img)
+            img1 = self.transform(img1)
             img2 = self.transform(img2)
-        return img, img2, label
+        return img1, img2, label
 
     def __len__(self):
         return len(self.targets)
@@ -99,13 +126,12 @@ def get_train_loader(root, which='source', img_size=256,
         rand_crop,
         transforms.Resize([img_size, img_size]),
         transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                             std=[0.5, 0.5, 0.5]),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
+                             std=[0.5, 0.5, 0.5, 0.5]),
     ])
 
     if which == 'source':
-        dataset = ImageFolder(root, transform)
+        dataset = NpyFolder(root, transform)
     elif which == 'reference':
         dataset = ReferenceDataset(root, transform)
     else:
@@ -195,11 +221,8 @@ class InputFetcher:
         x, y = self._fetch_inputs()
         if self.mode == 'train':
             x_ref, x_ref2, y_ref = self._fetch_refs()
-            z_trg = torch.randn(x.size(0), self.latent_dim)
-            z_trg2 = torch.randn(x.size(0), self.latent_dim)
             inputs = Munch(x_src=x, y_src=y, y_ref=y_ref,
-                           x_ref=x_ref, x_ref2=x_ref2,
-                           z_trg=z_trg, z_trg2=z_trg2)
+                           x_ref=x_ref, x_ref2=x_ref2)
         elif self.mode == 'val':
             x_ref, y_ref = self._fetch_inputs()
             inputs = Munch(x_src=x, y_src=y,

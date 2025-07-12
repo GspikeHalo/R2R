@@ -10,8 +10,9 @@ from uvcgan2.utils.log   import setup_logging
 from .metrics   import LossMetrics
 from .callbacks import TrainingHistory
 from .transfer  import transfer
+import wandb
 
-def training_epoch(it_train, model, title, steps_per_epoch):
+def training_epoch(it_train, model, title, steps_per_epoch, start_step):
     model.train()
 
     steps = len(it_train)
@@ -20,18 +21,23 @@ def training_epoch(it_train, model, title, steps_per_epoch):
 
     progbar = tqdm.tqdm(desc = title, total = steps, dynamic_ncols = True)
     metrics = LossMetrics()
+    global_step = start_step
 
     for batch in islice(it_train, steps):
         model.set_input(batch)
         model.optimization_step()
 
-        metrics.update(model.get_current_losses())
+        current = model.get_current_losses()
+        metrics.update(current)
 
-        progbar.set_postfix(metrics.values, refresh = False)
+        global_step += 1
+        wandb.log(current, step=global_step)
+
+        progbar.set_postfix(metrics.values, refresh=False)
         progbar.update()
 
     progbar.close()
-    return metrics
+    return metrics, global_step
 
 def try_continue_training(args, model):
     history = TrainingHistory(args.savedir)
@@ -48,6 +54,13 @@ def try_continue_training(args, model):
 
 def train(args_dict):
     args = Args.from_args_dict(**args_dict)
+
+    wandb.init(
+        project="StarGAN-R2R",
+        entity='bias-lab',
+        config=args_dict,
+        name='UCVGan V2'
+    )
 
     setup_logging(args.log_level)
     seed_everything(args.config.seed)
@@ -68,10 +81,11 @@ def train(args_dict):
     if (start_epoch == 0) and (args.transfer is not None):
         transfer(model, args.transfer)
 
+    global_step = 0
     for epoch in range(start_epoch + 1, args.epochs + 1):
         title   = 'Epoch %d / %d' % (epoch, args.epochs)
-        metrics = training_epoch(
-            it_train, model, title, args.config.steps_per_epoch
+        metrics, global_step = training_epoch(
+            it_train, model, title, args.config.steps_per_epoch, global_step
         )
 
         history.end_epoch(epoch, metrics)
@@ -81,4 +95,4 @@ def train(args_dict):
             model.save(epoch)
 
     model.save(epoch = None)
-
+    wandb.finish()

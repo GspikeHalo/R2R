@@ -65,7 +65,7 @@ args_dict = {
                 'dataset' : {
                     'name'   : 'starganV2',
                     'domain' : domain,
-                    'path'   : 'starganV2',
+                    'path'   : 'starganV2/train',
                 },
                 'shape'           : (4, 256, 256),
                 'transform_train' : [

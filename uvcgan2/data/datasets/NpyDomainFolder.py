@@ -30,8 +30,7 @@ class NpyDomainFolder(Dataset):
 
     def __init__(self, root, domain='A', split='train', transform=None):
         super().__init__()
-        domain = domain.upper()
-        subdir = f"{split}{domain}"
+        subdir = os.path.join(split, domain)
         self.folder = os.path.join(root, subdir)
         if not os.path.isdir(self.folder):
             raise ValueError(f"Directory not found: {self.folder}")
@@ -50,7 +49,7 @@ class NpyDomainFolder(Dataset):
     def __getitem__(self, idx):
         path = self.files[idx]
         arr  = np.load(path)            # load ndarray
-        tensor = torch.from_numpy(arr)  # convert to Tensor
+        tensor = torch.from_numpy(arr).float()  # convert to Tensor
         # Optionally, you could convert to PIL Image if your transforms expect that:
         # from PIL import Image
         # tensor = torch.from_numpy(arr)

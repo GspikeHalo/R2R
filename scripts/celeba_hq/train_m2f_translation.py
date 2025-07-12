@@ -63,16 +63,16 @@ args_dict = {
         'datasets' : [
             {
                 'dataset' : {
-                    'name'   : 'image-domain-hierarchy',
+                    'name'   : 'starganV2',
                     'domain' : domain,
-                    'path'   : 'celeba_hq_resized_lanczos',
+                    'path'   : 'starganV2',
                 },
-                'shape'           : (3, 256, 256),
+                'shape'           : (4, 256, 256),
                 'transform_train' : [
                     'random-flip-horizontal',
                 ],
                 'transform_test' : None,
-            } for domain in [ 'male', 'female' ]
+            } for domain in [ 'iphone-x', 'samsung-s9' ]
         ],
         'merge_type' : 'unpaired',
         'workers'    : 1,
@@ -127,7 +127,8 @@ args_dict = {
     'scheduler'       : None,
     'loss'            : 'lsgan',
     'steps_per_epoch' : 2000,
-    'transfer'        : get_transfer_preset(cmdargs),
+    'transfer': None,
+    # 'transfer'        : get_transfer_preset(cmdargs),
 # args
     'label'  : (
         f'{cmdargs.gen}-{cmdargs.head}_({cmdargs.no_pretrain}'

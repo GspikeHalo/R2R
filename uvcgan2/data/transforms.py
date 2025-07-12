@@ -40,3 +40,11 @@ def select_transform(transform):
     result.append(torchvision.transforms.ToTensor())
 
     return torchvision.transforms.Compose(result)
+
+def select_transform_npy(transform):
+    ops = []
+    if transform is not None:
+        if not isinstance(transform, (list, tuple)):
+            transform = [transform]
+        ops = [ select_single_transform(x) for x in transform ]
+    return torchvision.transforms.Compose(ops)

@@ -7,6 +7,7 @@ from uvcgan2.consts       import (
     ROOT_DATA, SPLIT_TRAIN, MERGE_PAIRED, MERGE_UNPAIRED
 )
 from uvcgan2.torch.select import extract_name_kwargs
+from .datasets.NpyDomainFolder import NpyDomainFolder
 
 from .datasets.celeba                 import CelebaDataset
 from .datasets.image_domain_folder    import ImageDomainFolder
@@ -14,7 +15,8 @@ from .datasets.image_domain_hierarchy import ImageDomainHierarchy
 from .datasets.zipper                 import DatasetZipper
 
 from .loader_zipper import DataLoaderZipper
-from .transforms    import select_transform
+from .transforms import select_transform, select_transform_npy
+
 
 def select_dataset(name, path, split, transform, **kwargs):
     if name == 'celeba':
@@ -42,13 +44,20 @@ def select_dataset(name, path, split, transform, **kwargs):
             os.path.join(path, split), transform = transform, **kwargs
         )
 
+    if name == 'starganV2':
+        return NpyDomainFolder(
+            path, transform = transform, split = split, **kwargs
+        )
     raise ValueError(f"Unknown dataset: {name}")
 
 def construct_single_dataset(dataset_config, split):
     name, kwargs = extract_name_kwargs(dataset_config.dataset)
     path         = os.path.join(ROOT_DATA, kwargs.pop('path', name))
 
-    if split == SPLIT_TRAIN:
+    if name == "starganV2":
+        t = dataset_config.transform_train if split == SPLIT_TRAIN else dataset_config.transform_test
+        transform = select_transform_npy(t)
+    elif split == SPLIT_TRAIN:
         transform = select_transform(dataset_config.transform_train)
     else:
         transform = select_transform(dataset_config.transform_test)

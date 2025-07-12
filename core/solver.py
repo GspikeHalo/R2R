@@ -24,6 +24,7 @@ from core.data_loader import InputFetcher
 import core.utils as utils
 from metrics.eval import calculate_metrics
 
+import wandb
 
 class Solver(nn.Module):
     def __init__(self, args):
@@ -138,6 +139,9 @@ class Solver(nn.Module):
                 all_losses['G/lambda_ds'] = args.lambda_ds
                 log += ' '.join(['%s: [%.4f]' % (key, value) for key, value in all_losses.items()])
                 print(log)
+
+                if args.use_wandb:
+                    wandb.log(all_losses, step=i+1)
 
             # # generate images for debugging
             # if (i+1) % args.sample_every == 0:

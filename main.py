@@ -19,6 +19,7 @@ from core.data_loader import get_train_loader
 from core.data_loader import get_test_loader
 from core.solver import Solver
 
+import wandb
 
 def str2bool(v):
     return v.lower() in ('true')
@@ -34,11 +35,19 @@ def main(args):
     cudnn.benchmark = True
     torch.manual_seed(args.seed)
 
+    if args.use_wandb:
+        wandb.init(
+            project='StarGAN-R2R',
+            entity='bias-lab',
+            config=vars(args),
+            name="stargan-v2_test"
+        )
+
     solver = Solver(args)
 
     if args.mode == 'train':
         assert len(subdirs(args.train_img_dir)) == args.num_domains
-        assert len(subdirs(args.val_img_dir)) == args.num_domains
+        # assert len(subdirs(args.val_img_dir)) == args.num_domains
         loaders = Munch(src=get_train_loader(root=args.train_img_dir,
                                              which='source',
                                              img_size=args.img_size,
@@ -50,12 +59,7 @@ def main(args):
                                              img_size=args.img_size,
                                              batch_size=args.batch_size,
                                              prob=args.randcrop_prob,
-                                             num_workers=args.num_workers),
-                        val=get_test_loader(root=args.val_img_dir,
-                                            img_size=args.img_size,
-                                            batch_size=args.val_batch_size,
-                                            shuffle=True,
-                                            num_workers=args.num_workers))
+                                             num_workers=args.num_workers))
         solver.train(loaders)
     elif args.mode == 'sample':
         assert len(subdirs(args.src_dir)) == args.num_domains
@@ -78,6 +82,9 @@ def main(args):
         align_faces(args, args.inp_dir, args.out_dir)
     else:
         raise NotImplementedError
+
+    if args.use_wandb:
+        wandb.finish()
 
 
 if __name__ == '__main__':
@@ -143,13 +150,13 @@ if __name__ == '__main__':
                         help='Seed for random number generator')
 
     # directory for training
-    parser.add_argument('--train_img_dir', type=str, default='data/celeba_hq/train',
+    parser.add_argument('--train_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
                         help='Directory containing training images')
-    parser.add_argument('--val_img_dir', type=str, default='data/celeba_hq/val',
+    parser.add_argument('--val_img_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/data/celeba_hq/val',
                         help='Directory containing validation images')
-    parser.add_argument('--sample_dir', type=str, default='expr/samples',
+    parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/samples',
                         help='Directory for saving generated images')
-    parser.add_argument('--checkpoint_dir', type=str, default='expr/checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/checkpoints',
                         help='Directory for saving network checkpoints')
 
     # directory for calculating metrics
@@ -177,6 +184,8 @@ if __name__ == '__main__':
     parser.add_argument('--sample_every', type=int, default=5000)
     parser.add_argument('--save_every', type=int, default=10000)
     parser.add_argument('--eval_every', type=int, default=50000)
+
+    parser.add_argument('--use_wandb', action='store_true')
 
     args = parser.parse_args()
     main(args)

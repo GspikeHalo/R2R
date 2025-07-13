@@ -152,10 +152,10 @@ class Solver(nn.Module):
             if (i+1) % args.save_every == 0:
                 self._save_checkpoint(step=i+1)
 
-            # compute FID and LPIPS if necessary
-            if (i+1) % args.eval_every == 0:
-                calculate_metrics(nets_ema, args, i+1, mode='latent')
-                calculate_metrics(nets_ema, args, i+1, mode='reference')
+            # # compute FID and LPIPS if necessary
+            # if (i+1) % args.eval_every == 0:
+            #     calculate_metrics(nets_ema, args, i+1, mode='latent')
+            #     calculate_metrics(nets_ema, args, i+1, mode='reference')
 
     @torch.no_grad()
     def sample(self, loaders):

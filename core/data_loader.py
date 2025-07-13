@@ -75,25 +75,31 @@ class NpyFolder(data.Dataset):
 
 class ReferenceDataset(data.Dataset):
     def __init__(self, root, transform=None):
-        self.samples, self.targets = self._make_dataset(root)
+        self.root = root
         self.transform = transform
+        self.samples, self.targets = self._make_dataset(root)
 
     def _make_dataset(self, root):
-        domains = os.listdir(root)
-        fnames, fnames2, labels = [], [], []
-        for idx, domain in enumerate(sorted(domains)):
+        domains = sorted(os.listdir(root))
+        fnames1, fnames2, labels = [], [], []
+        for idx, domain in enumerate(domains):
             class_dir = os.path.join(root, domain)
-            cls_fnames = listdir(class_dir)
-            fnames += cls_fnames
-            fnames2 += random.sample(cls_fnames, len(cls_fnames)) # disordered sequence
-            labels += [idx] * len(cls_fnames)
-        return list(zip(fnames, fnames2)), labels
+            if not os.path.isdir(class_dir):
+                continue
+            files = [f for f in os.listdir(class_dir) if f.endswith('.npy')]
+            paths = [os.path.join(class_dir, f) for f in files]
+            if len(paths) == 0:
+                continue
+            fnames1 += paths
+            fnames2 += random.sample(paths, len(paths))
+            labels += [idx] * len(paths)
+        return list(zip(fnames1, fnames2)), labels
 
     def __getitem__(self, index):
-        fname, fname2 = self.samples[index]
+        path1, path2 = self.samples[index]
         label = self.targets[index]
-        arr1 = np.load(str(fname))
-        arr2 = np.load(str(fname2))
+        arr1 = np.load(path1)
+        arr2 = np.load(path2)
         img1 = torch.from_numpy(arr1).float()
         img2 = torch.from_numpy(arr2).float()
         if self.transform is not None:
@@ -177,21 +183,20 @@ def get_eval_loader(root, img_size=256, batch_size=32,
 
 def get_test_loader(root, img_size=256, batch_size=32,
                     shuffle=True, num_workers=4):
-    print('Preparing DataLoader for the generation phase...')
+    print('Preparing DataLoader for the generation phase (4-ch npy)...')
     transform = transforms.Compose([
         transforms.Resize([img_size, img_size]),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                             std=[0.5, 0.5, 0.5]),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
+                             std =[0.5, 0.5, 0.5, 0.5]),
     ])
 
-    dataset = ImageFolder(root, transform)
-    return data.DataLoader(dataset=dataset,
-                           batch_size=batch_size,
-                           shuffle=shuffle,
-                           num_workers=num_workers,
-                           pin_memory=True)
+    dataset = NpyFolder(root, transform=transform)
 
+    return data.DataLoader(dataset=dataset,
+                      batch_size=batch_size,
+                      shuffle=shuffle,
+                      num_workers=num_workers,
+                      pin_memory=True)
 
 class InputFetcher:
     def __init__(self, loader, loader_ref=None, latent_dim=16, mode=''):

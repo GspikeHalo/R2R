@@ -47,7 +47,7 @@ def main(args):
 
     if args.mode == 'train':
         assert len(subdirs(args.train_img_dir)) == args.num_domains
-        # assert len(subdirs(args.val_img_dir)) == args.num_domains
+        assert len(subdirs(args.val_img_dir)) == args.num_domains
         loaders = Munch(src=get_train_loader(root=args.train_img_dir,
                                              which='source',
                                              img_size=args.img_size,
@@ -160,24 +160,24 @@ if __name__ == '__main__':
                         help='Directory for saving network checkpoints')
 
     # directory for calculating metrics
-    parser.add_argument('--eval_dir', type=str, default='expr/eval',
+    parser.add_argument('--eval_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/eval',
                         help='Directory for saving metrics, i.e., FID and LPIPS')
 
     # directory for testing
-    parser.add_argument('--result_dir', type=str, default='expr/results',
+    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/results',
                         help='Directory for saving generated images and videos')
     parser.add_argument('--src_dir', type=str, default='assets/representative/celeba_hq/src',
                         help='Directory containing input source images')
     parser.add_argument('--ref_dir', type=str, default='assets/representative/celeba_hq/ref',
                         help='Directory containing input reference images')
-    parser.add_argument('--inp_dir', type=str, default='assets/representative/custom/female',
-                        help='input directory when aligning faces')
-    parser.add_argument('--out_dir', type=str, default='assets/representative/celeba_hq/src/female',
-                        help='output directory when aligning faces')
+    # parser.add_argument('--inp_dir', type=str, default='assets/representative/custom/female',
+    #                     help='input directory when aligning faces')
+    # parser.add_argument('--out_dir', type=str, default='assets/representative/celeba_hq/src/female',
+    #                     help='output directory when aligning faces')
 
     # face alignment
-    parser.add_argument('--wing_path', type=str, default='expr/checkpoints/wing.ckpt')
-    parser.add_argument('--lm_path', type=str, default='expr/checkpoints/celeba_lm_mean.npz')
+    parser.add_argument('--wing_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/checkpoints/wing.ckpt')
+    parser.add_argument('--lm_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/checkpoints/celeba_lm_mean.npz')
 
     # step size
     parser.add_argument('--print_every', type=int, default=10)

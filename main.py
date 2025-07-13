@@ -14,10 +14,12 @@ import argparse
 from munch import Munch
 from torch.backends import cudnn
 import torch
+from torch.utils.data import DataLoader
 
-from core.data_loader import get_train_loader
+from core.data_loader import get_train_loader, PairedNpyDataset
 from core.data_loader import get_test_loader
 from core.solver import Solver
+from torchvision import transforms
 
 import wandb
 
@@ -76,7 +78,27 @@ def main(args):
                                             num_workers=args.num_workers))
         solver.sample(loaders)
     elif args.mode == 'eval':
-        solver.evaluate()
+        transform = transforms.Compose([
+            transforms.Resize([args.img_size, args.img_size]),
+            transforms.Normalize(mean=[0.5,0.5,0.5,0.5],
+                                 std =[0.5,0.5,0.5,0.5]),
+        ])
+        paired_ds = PairedNpyDataset(
+            root      = args.val_img_dir,
+            domain_o  = args.domain_o,
+            domain_t  = args.domain_t,
+            transform = transform
+        )
+        paired_loader = DataLoader(
+            paired_ds,
+            batch_size   = args.val_batch_size,
+            shuffle      = False,
+            num_workers  = args.num_workers,
+            pin_memory   = True
+        )
+
+        solver.mydata_loader = paired_loader
+        solver.test()
     elif args.mode == 'align':
         from core.wing import align_faces
         align_faces(args, args.inp_dir, args.out_dir)
@@ -166,10 +188,14 @@ if __name__ == '__main__':
     # directory for testing
     parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/results',
                         help='Directory for saving generated images and videos')
-    parser.add_argument('--src_dir', type=str, default='assets/representative/celeba_hq/src',
-                        help='Directory containing input source images')
-    parser.add_argument('--ref_dir', type=str, default='assets/representative/celeba_hq/ref',
-                        help='Directory containing input reference images')
+    # parser.add_argument('--src_dir', type=str, default='assets/representative/celeba_hq/src',
+    #                     help='Directory containing input source images')
+    # parser.add_argument('--ref_dir', type=str, default='assets/representative/celeba_hq/ref',
+    #                     help='Directory containing input reference images')
+    parser.add_argument('--domain_o', type=str, default='//media/Data_2/R2RResult/processed/starganV2/test/iphone-x',
+                        help = 'Original domain name under val_img_dir for paired test')
+    parser.add_argument('--domain_t', type=str, default='/media/Data_2/R2RResult/processed/starganV2/test/samsung-s9',
+                        help = 'Target   domain name under val_img_dir for paired test')
     # parser.add_argument('--inp_dir', type=str, default='assets/representative/custom/female',
     #                     help='input directory when aligning faces')
     # parser.add_argument('--out_dir', type=str, default='assets/representative/celeba_hq/src/female',

@@ -239,3 +239,46 @@ class InputFetcher:
 
         return Munch({k: v.to(self.device)
                       for k, v in inputs.items()})
+
+class PairedNpyDataset(data.Dataset):
+    """
+    返回 (img_o, img_t, filename, domain_o, domain_t)
+    """
+    def __init__(self, root: str, domain_o: str, domain_t: str, transform=None):
+        self.root     = Path(root)
+        self.domain_o = domain_o
+        self.domain_t = domain_t
+        self.transform = transform
+
+        self.dir_o = self.root / domain_o
+        self.dir_t = self.root / domain_t
+
+        # 找到两个域中都存在的 .npy 文件名
+        files_o = set(p.name for p in self.dir_o.glob('*.npy'))
+        files_t = set(p.name for p in self.dir_t.glob('*.npy'))
+        common = sorted(files_o & files_t)
+        if not common:
+            raise RuntimeError(f'No common files between {domain_o} and {domain_t}')
+
+        # 构造成对路径
+        self.pairs = [
+            (self.dir_o / fname, self.dir_t / fname)
+            for fname in common
+        ]
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        path_o, path_t = self.pairs[idx]
+        arr_o = np.load(str(path_o))     # (4, H, W)
+        arr_t = np.load(str(path_t))
+        img_o = torch.from_numpy(arr_o).float()
+        img_t = torch.from_numpy(arr_t).float()
+
+        if self.transform:
+            img_o = self.transform(img_o)
+            img_t = self.transform(img_t)
+        domain_o_name = Path(self.domain_o).name
+        domain_t_name = Path(self.domain_t).name
+        return img_o, img_t, path_o.name, domain_o_name, domain_t_name

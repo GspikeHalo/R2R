@@ -17,12 +17,15 @@ from munch import Munch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pytorch_msssim import SSIM
 
 from core.model import build_model
 from core.checkpoint import CheckpointIO
 from core.data_loader import InputFetcher
 import core.utils as utils
 from metrics.eval import calculate_metrics
+from tqdm import tqdm
+from torchvision.utils import save_image
 
 import wandb
 
@@ -183,6 +186,111 @@ class Solver(nn.Module):
         self._load_checkpoint(args.resume_iter)
         calculate_metrics(nets_ema, args, step=resume_iter, mode='latent')
         calculate_metrics(nets_ema, args, step=resume_iter, mode='reference')
+
+    def denorm(self, x):
+        """Convert the range from [-1, 1] to [0, 1]."""
+        out = (x + 1) / 2
+        return out.clamp_(0, 1)
+
+    @torch.no_grad()
+    def test(self):
+        """对成对数据进行正向 (O→T) 和 反向 (T→O) 的 MAE / PSNR / SSIM 评估，并保存三联图。"""
+        # 1) 恢复 EMA 模型
+        self._load_checkpoint(self.args.resume_iter)
+        self.generator_ema.eval()
+        self.style_encoder_ema.eval()
+
+        # 2) 指标累加
+        tot_mae_f = tot_psnr_f = tot_ssim_f = 0.0
+        tot_mae_r = tot_psnr_r = tot_ssim_r = 0.0
+        tot_imgs = 0
+
+        # PSNR 计算
+        def _psnr(x, y, max_val=1.0, eps=1e-10):
+            mse = ((x - y)**2).mean(dim=[1,2,3])
+            return 10 * torch.log10(max_val**2 / (mse + eps))
+
+        # SSIM 函数（4 通道）
+        ssim_fn = SSIM(data_range=1.0, channel=4, size_average=False).to(self.device)
+
+        # RGGB → RGB 用于可视化
+        def rggb2rgb(img):
+            r, gr, gb, b = img[0], img[1], img[2], img[3]
+            g = 0.5 * (gr + gb)
+            return torch.stack([r, g, b], dim=0)
+
+        # 3) 构建 domain→idx 映射（与 PairedNpyDataset 使用的子目录一致）
+        domains = sorted(os.listdir(self.args.val_img_dir))
+        domain2idx = {d:i for i,d in enumerate(domains)}
+
+        # 4) 遍历 paired loader
+        for x_o, x_t, filenames, domain_o_list, domain_t_list in tqdm(self.mydata_loader, desc='Testing'):
+            B = x_o.size(0)
+            tot_imgs += B
+
+            x_o = x_o.to(self.device)
+            x_t = x_t.to(self.device)
+
+            # 4.1) 构造标签向量
+            idx_o = domain2idx[domain_o_list[0]]  # PairedNpyDataset 保证同 batch 全一致
+            idx_t = domain2idx[domain_t_list[0]]
+            y_o = torch.full((B,), idx_o, device=self.device, dtype=torch.long)
+            y_t = torch.full((B,), idx_t, device=self.device, dtype=torch.long)
+
+            # —— Forward: O→T ——
+            s_t        = self.style_encoder_ema(x_t, y_t)
+            x_pred     = self.generator_ema(x_o, s_t)
+            x_pred_den = self.denorm(x_pred)
+            x_t_den    = self.denorm(x_t)
+
+            mae_f  = torch.abs(x_pred_den - x_t_den).view(B, -1).mean(dim=1).sum().item()
+            psnr_f = _psnr(x_pred_den, x_t_den).sum().item()
+            ssim_f = ssim_fn(x_pred_den, x_t_den).sum().item()
+            tot_mae_f  += mae_f
+            tot_psnr_f += psnr_f
+            tot_ssim_f += ssim_f
+
+            # —— Reverse: T→O ——
+            s_o     = self.style_encoder_ema(x_o, y_o)
+            x_rev   = self.generator_ema(x_t, s_o)
+            x_rev_den = self.denorm(x_rev)
+            x_o_den   = self.denorm(x_o)
+
+            mae_r  = torch.abs(x_rev_den - x_o_den).view(B, -1).mean(dim=1).sum().item()
+            psnr_r = _psnr(x_rev_den, x_o_den).sum().item()
+            ssim_r = ssim_fn(x_rev_den, x_o_den).sum().item()
+            tot_mae_r  += mae_r
+            tot_psnr_r += psnr_r
+            tot_ssim_r += ssim_r
+
+            # 5) 可视化三联图（每批次最多 5 张）
+            V = min(5, B)
+            for k in range(V):
+                trip_f = torch.stack([
+                    rggb2rgb(x_o_den[k]),
+                    rggb2rgb(x_pred_den[k]),
+                    rggb2rgb(x_t_den[k])
+                ], dim=0)
+                save_image(trip_f,
+                           f"{self.args.result_dir}/batch_{k:03d}_fwd.png",
+                           nrow=3)
+
+                trip_r = torch.stack([
+                    rggb2rgb(x_t_den[k]),
+                    rggb2rgb(x_rev_den[k]),
+                    rggb2rgb(x_o_den[k])
+                ], dim=0)
+                save_image(trip_r,
+                           f"{self.args.result_dir}/batch_{k:03d}_rev.png",
+                           nrow=3)
+
+        # 6) 打印平均指标
+        print(f'Forward  MAE:{tot_mae_f/tot_imgs:.4f}, '
+              f'PSNR:{tot_psnr_f/tot_imgs:.2f}, '
+              f'SSIM:{tot_ssim_f/tot_imgs:.4f}')
+        print(f'Reverse  MAE:{tot_mae_r/tot_imgs:.4f}, '
+              f'PSNR:{tot_psnr_r/tot_imgs:.2f}, '
+              f'SSIM:{tot_ssim_r/tot_imgs:.4f}')
 
 
 def compute_d_loss(nets, args, x_real, y_org, y_trg, z_trg=None, x_ref=None, masks=None):

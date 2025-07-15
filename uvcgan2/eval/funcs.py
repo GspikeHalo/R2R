@@ -3,8 +3,8 @@ import math
 from itertools import islice
 
 from uvcgan2.config            import Args
-from uvcgan2.consts            import (
-    MODEL_STATE_TRAIN, MODEL_STATE_EVAL, MERGE_NONE
+from uvcgan2.consts import (
+    MODEL_STATE_TRAIN, MODEL_STATE_EVAL, MERGE_NONE, MERGE_PAIRED
 )
 from uvcgan2.data              import construct_data_loaders
 from uvcgan2.torch.funcs       import get_torch_device_smart, seed_everything
@@ -79,11 +79,11 @@ def start_model_eval(path, epoch, model_state, merge_type, **config_overrides):
     return (args, model, evaldir)
 
 def load_eval_model_dset_from_cmdargs(
-    cmdargs, merge_type = MERGE_NONE, **config_overrides
+    cmdargs, merge_type = MERGE_PAIRED, **config_overrides
 ):
     args, model, evaldir = start_model_eval(
         cmdargs.model, cmdargs.epoch, cmdargs.model_state,
-        merge_type = merge_type,
+        merge_type = MERGE_PAIRED,
         batch_size = cmdargs.batch_size, **config_overrides
     )
 

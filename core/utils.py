@@ -277,3 +277,11 @@ def save_video(fname, images, output_fps=30, vcodec='libx264', filters=''):
 def tensor2ndarray255(images):
     images = torch.clamp(images * 0.5 + 0.5, 0, 1)
     return images.cpu().numpy().transpose(0, 2, 3, 1) * 255
+
+def pad_image(image, patch_size):
+    h, w = image.shape[-2:]
+    pad_h = (patch_size - h % patch_size) % patch_size
+    pad_w = (patch_size - w % patch_size) % patch_size
+
+    image = F.pad(image, (0, pad_w, 0, pad_h))
+    return image

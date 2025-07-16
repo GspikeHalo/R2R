@@ -7,7 +7,7 @@ from functools import partial
 
 from pandas.core.reshape.reshape import unstack
 from timm.models.layers import DropPath, trunc_normal_
-from utils import pad_image
+from core.utils import pad_image
 import time
 import torch.utils.benchmark as benchmark
 
@@ -92,7 +92,7 @@ class AdaIN(nn.Module):
         return (1 + gamma) * self.norm(x) + beta
 
 class ConvAdaINBlock(nn.Module):
-    def __init__(self, inplanes, outplane, act_layer=nn.LeakyReLU(0.2),
+    def __init__(self, inplanes, outplane, act_layer=nn.LeakyReLU,
                 upsample=2, style_dim=64):
         super(ConvAdaINBlock, self).__init__()
         self.upsample = upsample
@@ -100,15 +100,15 @@ class ConvAdaINBlock(nn.Module):
         med_planes = outplane // 4
 
         self.norm1 = AdaIN(style_dim, inplanes)
+        self.act1 = act_layer(0.2, inplace=True)
         self.conv1 = nn.Conv2d(inplanes, med_planes, kernel_size=1, stride=1, padding=0, bias=False)
-        self.act1 = act_layer(inplace=True)
 
         self.norm2 = AdaIN(style_dim, med_planes)
+        self.act2 = act_layer(0.2, inplace=True)
         self.conv2 = nn.Conv2d(med_planes, med_planes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.act2 = act_layer(inplace=True)
 
-        self.norm3 = AdaIN(style_dim, outplane)
-        self.act3 = act_layer(inplace=True)
+        self.norm3 = AdaIN(style_dim, med_planes)
+        self.act3 = act_layer(0.2, inplace=True)
         self.conv3 = nn.Conv2d(med_planes, outplane, kernel_size=1, stride=1, padding=0, bias=False)
 
         if self.learned_sc:
@@ -522,7 +522,7 @@ class Conformer(nn.Module):
             nn.init.constant_(m.bias, 0.)
 
 
-    def forward(self, x, s):
+    def forward(self, x, s, masks=None):
         B,C,H,W = x.shape
         x = pad_image(x, 32*self.down_scale_times)
         image = x

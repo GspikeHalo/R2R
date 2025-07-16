@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from core.wing import FAN
-from generator import Conformer
+from core.generator import Conformer
 
 
 class ResBlk(nn.Module):

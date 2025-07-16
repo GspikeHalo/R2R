@@ -1,7 +1,11 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
+
+from pandas.core.reshape.reshape import unstack
 from timm.models.layers import DropPath, trunc_normal_
 from utils import pad_image
 import time
@@ -74,6 +78,68 @@ class Block(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
+
+class AdaIN(nn.Module):
+    def __init__(self, style_dim, num_features):
+        super().__init__()
+        self.norm = nn.InstanceNorm2d(num_features, affine=False)
+        self.fc = nn.Linear(style_dim, num_features*2)
+
+    def forward(self, x, s):
+        h = self.fc(s)
+        h = h.view(h.size(0), h.size(1), 1, 1)
+        gamma, beta = torch.chunk(h, chunks=2, dim=1)
+        return (1 + gamma) * self.norm(x) + beta
+
+class ConvAdaINBlock(nn.Module):
+    def __init__(self, inplanes, outplane, act_layer=nn.LeakyReLU(0.2),
+                upsample=2, style_dim=64):
+        super(ConvAdaINBlock, self).__init__()
+        self.upsample = upsample
+        self.learned_sc = (inplanes != outplane)
+        med_planes = outplane // 4
+
+        self.norm1 = AdaIN(style_dim, inplanes)
+        self.conv1 = nn.Conv2d(inplanes, med_planes, kernel_size=1, stride=1, padding=0, bias=False)
+        self.act1 = act_layer(inplace=True)
+
+        self.norm2 = AdaIN(style_dim, med_planes)
+        self.conv2 = nn.Conv2d(med_planes, med_planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.act2 = act_layer(inplace=True)
+
+        self.norm3 = AdaIN(style_dim, outplane)
+        self.act3 = act_layer(inplace=True)
+        self.conv3 = nn.Conv2d(med_planes, outplane, kernel_size=1, stride=1, padding=0, bias=False)
+
+        if self.learned_sc:
+            self.conv1x1 = nn.Conv2d(inplanes, outplane, kernel_size=1, stride=1, padding=0, bias=False)
+
+    def _shortcut(self, x):
+        if self.upsample:
+            x = F.interpolate(x, scale_factor=self.upsample, mode='nearest')
+        if self.learned_sc:
+            x = self.conv1x1(x)
+        return x
+
+    def _residual(self, x, s):
+        x = self.norm1(x, s)
+        x = self.act1(x)
+        if self.upsample:
+            x = F.interpolate(x, scale_factor=self.upsample, mode='nearest')
+        x = self.conv1(x)
+
+        x = self.norm2(x, s)
+        x = self.act2(x)
+        x = self.conv2(x)
+        x = self.norm3(x, s)
+        x = self.act3(x)
+        x = self.conv3(x)
+        return x
+
+    def forward(self, x, s):
+        out = self._residual(x, s)
+        out = (out + self._shortcut(x)) / math.sqrt(2.)
+        return out
 
 class ConvBlock(nn.Module):
 
@@ -307,4 +373,177 @@ class ConvTransBlock(nn.Module):
 
         return x, x_t
 
+class Conformer(nn.Module):
 
+    def __init__(self, patch_size=16, in_channels=4, base_channel=32, channel_ratio=2, num_med_block=0,
+                 embed_dim=256, depth=6, num_heads=4, mlp_ratio=4., qkv_bias=False, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0., poly=2, share_model=None,transformer_branch_weight=None,down_scale_times=1,freeze_generator=False,poly_add_const=False,global_mapping=False, style_dim=64):
+
+        # Transformer
+        super().__init__()
+        self.down_scale_times = down_scale_times
+        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
+        assert depth % 3 == 0
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+
+        self.trans_dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+
+        # Classifier head
+        self.trans_norm = nn.LayerNorm(embed_dim)
+
+        self.pooling = nn.AdaptiveAvgPool2d(1)
+
+
+        # Stem stage: get the feature maps by conv block (copied form resnet.py)
+        self.conv1 = nn.Conv2d(self.in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)  # 1 / 2 [128, 128] c = 64
+        self.bn1 = nn.BatchNorm2d(64)
+        self.act1 = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=2, stride=2)  # 1 / 4 [64, 64]
+
+        # 1 stage
+        stage_1_channel = int(base_channel * channel_ratio)
+        trans_dw_stride = patch_size // 4 # 4
+        self.conv_1 = ConvBlock(inplanes=64, outplanes=stage_1_channel, res_conv=True, stride=1) # 64 c = 64
+        self.trans_patch_conv = nn.Conv2d(64, embed_dim, kernel_size=trans_dw_stride, stride=trans_dw_stride, padding=0) # 16
+        self.trans_1 = Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+                             qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=self.trans_dpr[0],
+                             )
+
+        # 2~4 stage
+        init_stage = 2
+        fin_stage = depth // 3 + 1 # 3
+        # [2], generate 'conv_trans_2'
+        for i in range(init_stage, fin_stage):
+            self.add_module('conv_trans_' + str(i),
+                            ConvTransBlock(
+                                stage_1_channel, stage_1_channel, False, 1, dw_stride=trans_dw_stride,
+                                embed_dim=embed_dim,
+                                num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
+                                drop_path_rate=self.trans_dpr[i - 1],
+                                num_med_block=num_med_block
+                            )
+                            )
+        # [16, 16] c = 64
+
+        stage_2_channel = int(base_channel * channel_ratio * 2)
+        # 5~8 stage
+        init_stage = fin_stage  # 3
+        fin_stage = fin_stage + depth // 3  # 5
+        # [3, 4], generate 'conv_trans_3', 'conv_trans_4'
+        for i in range(init_stage, fin_stage):
+            s = 2 if i == init_stage else 1
+            in_channel = stage_1_channel if i == init_stage else stage_2_channel
+            res_conv = True if i == init_stage else False
+            self.add_module('conv_trans_' + str(i),
+                            ConvTransBlock(
+                                in_channel, stage_2_channel, res_conv, s, dw_stride=trans_dw_stride // 2,
+                                embed_dim=embed_dim,
+                                num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
+                                drop_path_rate=self.trans_dpr[i - 1],
+                                num_med_block=num_med_block
+                            )
+                            )
+        # [8, 8] c = 128
+
+        stage_3_channel = int(base_channel * channel_ratio * 2 * 2)
+        # 9~12 stage
+        init_stage = fin_stage  # 5
+        fin_stage = fin_stage + depth // 3  # 7
+        # [5, 6], generate 'conv_trans_5', 'conv_trans_6'
+        for i in range(init_stage, fin_stage):
+            s = 2 if i == init_stage else 1
+            in_channel = stage_2_channel if i == init_stage else stage_3_channel
+            res_conv = True if i == init_stage else False
+            last_fusion = True if i == depth else False
+            self.add_module('conv_trans_' + str(i),
+                            ConvTransBlock(
+                                in_channel, stage_3_channel, res_conv, s, dw_stride=trans_dw_stride // 4,
+                                embed_dim=embed_dim,
+                                num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
+                                drop_path_rate=self.trans_dpr[i - 1],
+                                num_med_block=num_med_block, last_fusion=last_fusion
+                            )
+                            )
+        # [4, 4] c = 256
+
+        self.up_blocks = nn.Sequential(
+            ConvAdaINBlock(256, 256, upsample=2, style_dim=style_dim),  # 4x4 -> 8x8
+            ConvAdaINBlock(256, 128, upsample=2, style_dim=style_dim),  # 8x8 -> 16x16
+            ConvAdaINBlock(128, 64, upsample=2, style_dim=style_dim),  # 16x16 -> 32x32
+            ConvAdaINBlock(64, 32, upsample=2, style_dim=style_dim),  # 32x32 -> 64x64
+            ConvAdaINBlock(32, 16, upsample=2, style_dim=style_dim),  # 64x64 -> 128x128
+            ConvAdaINBlock(16, 4, upsample=2, style_dim=style_dim),  # 128x128 -> 256x256
+        )
+
+
+        self.out1 = nn.Sequential(nn.Linear(in_features=embed_dim,out_features=embed_dim),
+                                  nn.Linear(in_features=embed_dim,out_features=56))
+        self.fin_stage = fin_stage
+        self.apply(self._init_weights)
+
+        self.poly_add_const = poly_add_const
+        if share_model is not None:
+            for name, share_module in share_model.named_modules():
+                if 'out' in name or 'light' in name:
+                    continue
+                if isinstance(share_module,(nn.Linear,nn.Conv2d)):
+                    module = self
+                    if '.' in name:
+                        name = name.split('.')
+                    else:
+                        name = [name]
+                    for n in name[:-1]:
+                        module = getattr(module,n)
+                    setattr(module,name[-1],share_module)
+                    if freeze_generator:
+                        module.requires_grad_(False)
+
+
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1.)
+            nn.init.constant_(m.bias, 0.)
+        elif isinstance(m, nn.GroupNorm):
+            nn.init.constant_(m.weight, 1.)
+            nn.init.constant_(m.bias, 0.)
+
+
+    def forward(self, x, s):
+        B,C,H,W = x.shape
+        x = pad_image(x, 32*self.down_scale_times)
+        image = x
+        x = F.interpolate(x,mode='bilinear',scale_factor=1.0/self.down_scale_times)
+        # stem stage [N, 3, 224, 224] -> [N, 64, 56, 56]
+        x_base = self.maxpool(self.act1(self.bn1(self.conv1(x))))
+
+        # 1 stage
+        x = self.conv_1(x_base, return_x_2=False)
+
+        # [batch_size, patch_nums,embed_dim]
+        x_t = self.trans_patch_conv(x_base).flatten(2).transpose(1, 2)
+        # [batch_size, patch_nums+1,embed_dim]
+        x_t = self.trans_1(x_t)
+
+        # 2 ~ final
+        for i in range(2, self.fin_stage):
+            x, x_t = getattr(self, f'conv_trans_{i}')(x, x_t) # x is conv's bottleneck
+
+        out = x
+        for block in self.up_blocks:
+            out = block(out, s)
+
+        return out

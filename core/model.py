@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from core.wing import FAN
+from generator import Conformer
 
 
 class ResBlk(nn.Module):
@@ -281,7 +282,8 @@ class Discriminator(nn.Module):
 
 
 def build_model(args):
-    generator = nn.DataParallel(Generator(args.img_size, args.style_dim, w_hpf=args.w_hpf))
+    # generator = nn.DataParallel(Generator(args.img_size, args.style_dim, w_hpf=args.w_hpf))
+    generator = nn.DataParallel(Conformer(args.img_size, style_dim=args.style_dim))
     # mapping_network = nn.DataParallel(MappingNetwork(args.latent_dim, args.style_dim, args.num_domains))
     style_encoder = nn.DataParallel(StyleEncoder(args.img_size, args.style_dim, args.num_domains))
     discriminator = nn.DataParallel(Discriminator(args.img_size, args.num_domains))

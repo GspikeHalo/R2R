@@ -471,12 +471,11 @@ class Conformer(nn.Module):
         # [4, 4] c = 256
 
         self.up_blocks = nn.Sequential(
-            ConvAdaINBlock(256, 256, upsample=2, style_dim=style_dim),  # 4x4 -> 8x8
-            ConvAdaINBlock(256, 128, upsample=2, style_dim=style_dim),  # 8x8 -> 16x16
-            ConvAdaINBlock(128, 64, upsample=2, style_dim=style_dim),  # 16x16 -> 32x32
-            ConvAdaINBlock(64, 32, upsample=2, style_dim=style_dim),  # 32x32 -> 64x64
-            ConvAdaINBlock(32, 16, upsample=2, style_dim=style_dim),  # 64x64 -> 128x128
-            ConvAdaINBlock(16, 4, upsample=2, style_dim=style_dim),  # 128x128 -> 256x256
+            ConvAdaINBlock(256, 256, upsample=2, style_dim=style_dim),  # 8→16
+            ConvAdaINBlock(256, 128, upsample=2, style_dim=style_dim),  # 16→32
+            ConvAdaINBlock(128, 64,  upsample=2, style_dim=style_dim),  # 32→64
+            ConvAdaINBlock(64,  32,  upsample=2, style_dim=style_dim),  # 64→128
+            ConvAdaINBlock(32,  4,   upsample=2, style_dim=style_dim),  # 128→256
         )
 
 
@@ -545,5 +544,4 @@ class Conformer(nn.Module):
         out = x
         for block in self.up_blocks:
             out = block(out, s)
-
         return out

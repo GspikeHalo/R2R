@@ -82,7 +82,7 @@ class Block(nn.Module):
 class AdaIN(nn.Module):
     def __init__(self, style_dim, num_features):
         super().__init__()
-        self.norm = nn.InstanceNorm2d(num_features, affine=False)
+        self.norm = nn.InstanceNorm2d(num_features, affine=True, eps=1e-6)
         self.fc = nn.Linear(style_dim, num_features*2)
 
     def forward(self, x, s):
@@ -92,24 +92,24 @@ class AdaIN(nn.Module):
         return (1 + gamma) * self.norm(x) + beta
 
 class ConvAdaINBlock(nn.Module):
-    def __init__(self, inplanes, outplane, act_layer=nn.LeakyReLU,
+    def __init__(self, inplanes, outplane, act_layer=nn.ReLU,
                 upsample=2, style_dim=64):
         super(ConvAdaINBlock, self).__init__()
         self.upsample = upsample
         self.learned_sc = (inplanes != outplane)
         med_planes = outplane // 4
 
-        self.norm1 = AdaIN(style_dim, inplanes)
-        self.act1 = act_layer(0.2, inplace=True)
         self.conv1 = nn.Conv2d(inplanes, med_planes, kernel_size=1, stride=1, padding=0, bias=False)
+        self.norm1 = AdaIN(style_dim, med_planes)
+        self.act1 = act_layer(inplace=True)
 
-        self.norm2 = AdaIN(style_dim, med_planes)
-        self.act2 = act_layer(0.2, inplace=True)
         self.conv2 = nn.Conv2d(med_planes, med_planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.norm2 = AdaIN(style_dim, med_planes)
+        self.act2 = act_layer(inplace=True)
 
-        self.norm3 = AdaIN(style_dim, med_planes)
-        self.act3 = act_layer(0.2, inplace=True)
         self.conv3 = nn.Conv2d(med_planes, outplane, kernel_size=1, stride=1, padding=0, bias=False)
+        self.norm3 = AdaIN(style_dim, outplane)
+        self.act3 = act_layer(inplace=True)
 
         if self.learned_sc:
             self.conv1x1 = nn.Conv2d(inplanes, outplane, kernel_size=1, stride=1, padding=0, bias=False)
@@ -122,21 +122,22 @@ class ConvAdaINBlock(nn.Module):
         return x
 
     def _residual(self, x, s):
-        x = self.norm1(x, s)
-        x = self.act1(x)
         if self.upsample:
             x = F.interpolate(x, scale_factor=self.upsample, mode='nearest')
         x = self.conv1(x)
-
+        x = self.norm1(x, s)
+        x = self.act1(x)
+        x = self.conv2(x)
         x = self.norm2(x, s)
         x = self.act2(x)
-        x = self.conv2(x)
+        x = self.conv3(x)
         x = self.norm3(x, s)
         x = self.act3(x)
-        x = self.conv3(x)
         return x
 
-    def forward(self, x, s):
+    def forward(self, x, s, tok_map=None):
+        if tok_map is not None:
+            x = x + tok_map
         out = self._residual(x, s)
         out = (out + self._shortcut(x)) / math.sqrt(2.)
         return out
@@ -144,7 +145,7 @@ class ConvAdaINBlock(nn.Module):
 class ConvBlock(nn.Module):
 
     def __init__(self, inplanes, outplanes, stride=1, res_conv=False, act_layer=nn.ReLU, groups=1,
-                 norm_layer=partial(nn.BatchNorm2d, eps=1e-6), drop_block=None, drop_path=None):
+                 norm_layer=partial(nn.InstanceNorm2d, eps=1e-6, affine=True), drop_block=None, drop_path=None):
         super(ConvBlock, self).__init__()
 
         expansion = 4
@@ -240,7 +241,7 @@ class FCUUp(nn.Module):
     """
 
     def __init__(self, inplanes, outplanes, up_stride, act_layer=nn.ReLU,
-                 norm_layer=partial(nn.BatchNorm2d, eps=1e-6), ):
+                 norm_layer=partial(nn.InstanceNorm2d, affine=True, eps=1e-6), ):
         super(FCUUp, self).__init__()
 
         self.up_stride = up_stride
@@ -261,7 +262,7 @@ class Med_ConvBlock(nn.Module):
     """ special case for Convblock with down sampling,
     """
 
-    def __init__(self, inplanes, act_layer=nn.ReLU, groups=1, norm_layer=partial(nn.BatchNorm2d, eps=1e-6),
+    def __init__(self, inplanes, act_layer=nn.ReLU, groups=1, norm_layer=partial(nn.InstanceNorm2d, eps=1e-6, affine=True),
                  drop_block=None, drop_path=None):
 
         super(Med_ConvBlock, self).__init__()
@@ -397,15 +398,15 @@ class Conformer(nn.Module):
 
         # Stem stage: get the feature maps by conv block (copied form resnet.py)
         self.conv1 = nn.Conv2d(self.in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)  # 1 / 2 [128, 128] c = 64
-        self.bn1 = nn.BatchNorm2d(64)
+        self.bn1 = nn.InstanceNorm2d(64, affine=True)
         self.act1 = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=2, stride=2)  # 1 / 4 [64, 64]
 
         # 1 stage
-        stage_1_channel = int(base_channel * channel_ratio)
+        stage_1_channel = int(base_channel * channel_ratio) # 64
         trans_dw_stride = patch_size // 4 # 4
         self.conv_1 = ConvBlock(inplanes=64, outplanes=stage_1_channel, res_conv=True, stride=1) # 64 c = 64
-        self.trans_patch_conv = nn.Conv2d(64, embed_dim, kernel_size=trans_dw_stride, stride=trans_dw_stride, padding=0) # 16
+        self.trans_patch_conv = nn.Conv2d(64, embed_dim, kernel_size=trans_dw_stride, stride=trans_dw_stride, padding=0)
         self.trans_1 = Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
                              qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=self.trans_dpr[0],
                              )
@@ -425,8 +426,8 @@ class Conformer(nn.Module):
                                 num_med_block=num_med_block
                             )
                             )
-        # [16, 16] c = 64
 
+        # [16, 16] c = 128
         stage_2_channel = int(base_channel * channel_ratio * 2)
         # 5~8 stage
         init_stage = fin_stage  # 3
@@ -446,9 +447,9 @@ class Conformer(nn.Module):
                                 num_med_block=num_med_block
                             )
                             )
-        # [8, 8] c = 128
 
-        stage_3_channel = int(base_channel * channel_ratio * 2 * 2)
+        # [8, 8] c = 256
+        stage_3_channel = int(base_channel * channel_ratio * 2 * 2) # 256
         # 9~12 stage
         init_stage = fin_stage  # 5
         fin_stage = fin_stage + depth // 3  # 7
@@ -468,7 +469,16 @@ class Conformer(nn.Module):
                                 num_med_block=num_med_block, last_fusion=last_fusion
                             )
                             )
-        # [4, 4] c = 256
+        # self.tok_ups = nn.ModuleList([
+        #     FCUUp(inplanes=embed_dim, outplanes=ch, up_stride=stride)
+        #     for (ch, stride) in [
+        #         (256, 4),  # bottleneck(4×4) → 16×16
+        #         (128, 2),  # 16→32
+        #         (64, 2),  # 32→64
+        #         (32, 2),  # 64→128
+        #         (4, 2),  # 128→256
+        #     ]
+        # ])
 
         self.up_blocks = nn.Sequential(
             ConvAdaINBlock(256, 256, upsample=2, style_dim=style_dim),  # 8→16
@@ -478,9 +488,6 @@ class Conformer(nn.Module):
             ConvAdaINBlock(32,  4,   upsample=2, style_dim=style_dim),  # 128→256
         )
 
-
-        self.out1 = nn.Sequential(nn.Linear(in_features=embed_dim,out_features=embed_dim),
-                                  nn.Linear(in_features=embed_dim,out_features=56))
         self.fin_stage = fin_stage
         self.apply(self._init_weights)
 
@@ -519,29 +526,34 @@ class Conformer(nn.Module):
         elif isinstance(m, nn.GroupNorm):
             nn.init.constant_(m.weight, 1.)
             nn.init.constant_(m.bias, 0.)
+        elif isinstance(m, nn.InstanceNorm2d):
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
 
 
     def forward(self, x, s, masks=None):
-        B,C,H,W = x.shape
+        # B,C,H,W = x.shape
+        # image = x
         x = pad_image(x, 32*self.down_scale_times)
         image = x
         x = F.interpolate(x,mode='bilinear',scale_factor=1.0/self.down_scale_times)
-        # stem stage [N, 3, 224, 224] -> [N, 64, 56, 56]
+        # stem stage [N, 4, 256, 256] -> [N, 64, 64, 64]
         x_base = self.maxpool(self.act1(self.bn1(self.conv1(x))))
 
-        # 1 stage
+        # 1 stage [N, 64, 32, 32]
         x = self.conv_1(x_base, return_x_2=False)
 
         # [batch_size, patch_nums,embed_dim]
         x_t = self.trans_patch_conv(x_base).flatten(2).transpose(1, 2)
-        # [batch_size, patch_nums+1,embed_dim]
         x_t = self.trans_1(x_t)
 
         # 2 ~ final
+        x_ts = []
         for i in range(2, self.fin_stage):
             x, x_t = getattr(self, f'conv_trans_{i}')(x, x_t) # x is conv's bottleneck
+            x_ts.append(x_t)
 
-        out = x
         for block in self.up_blocks:
-            out = block(out, s)
-        return out
+            x = block(x, s)
+        x = x + image
+        return x

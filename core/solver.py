@@ -266,6 +266,7 @@ class Solver(nn.Module):
         # 3) 构建 domain→idx 映射（与 PairedNpyDataset 使用的子目录一致）
         domains = sorted(os.listdir(self.args.val_img_dir))
         domain2idx = {d:i for i,d in enumerate(domains)}
+        os.makedirs(self.args.result_dir, exist_ok=True)
 
         # 4) 遍历 paired loader
         for batch_i, (x_o, x_t, filenames, domain_o_list, domain_t_list) in enumerate(
@@ -337,9 +338,9 @@ class Solver(nn.Module):
         avg_psnr_r = tot_psnr_r / tot_imgs
         avg_ssim_r = tot_ssim_r / tot_imgs
 
-        avg_mae = avg_mae_f + avg_mae_r / 2
-        avg_ssim = avg_ssim_f + avg_ssim_r / 2
-        avg_psnr = avg_psnr_f + avg_psnr_r / 2
+        avg_mae = (avg_mae_f + avg_mae_r) / 2
+        avg_ssim = (avg_ssim_f + avg_ssim_r) / 2
+        avg_psnr = (avg_psnr_f + avg_psnr_r) / 2
 
         print(f'Forward  MAE:{avg_mae_f:.4f}, '
               f'PSNR:{avg_psnr_f:.2f}, '
@@ -355,14 +356,14 @@ class Solver(nn.Module):
             import wandb
             wandb.log({
                 'Test/MAE_forward':  avg_mae_f,
-                'Test/PSNR_forward': avg_psnr_f,
-                'Test/SSIM_forward': avg_ssim_f,
-                'Test/MAE_reverse':  avg_mae_r,
-                'Test/PSNR_reverse': avg_psnr_r,
-                'Test/SSIM_reverse': avg_ssim,
+                'Test/MAE_reverse': avg_mae_r,
                 'Test/MAE': avg_mae,
+                'Test/SSIM_forward': avg_ssim_f,
+                'Test/SSIM_reverse': avg_ssim_r,
+                'Test/SSIM': avg_ssim,
+                'Test/PSNR_forward': avg_psnr_f,
+                'Test/PSNR_reverse': avg_psnr_r,
                 'Test/PSNR': avg_psnr,
-                'Test/SSIM': avg_ssim_r,
             }, step=step)
 
 

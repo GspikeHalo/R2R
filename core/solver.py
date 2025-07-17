@@ -88,8 +88,8 @@ class Solver(nn.Module):
 
         # fetch random validation images for debugging
         fetcher = InputFetcher(loaders.src, loaders.ref, args.latent_dim, 'train')
-        # fetcher_val = InputFetcher(loaders.val, None, args.latent_dim, 'val')
-        # inputs_val = next(fetcher_val)
+        fetcher_val = InputFetcher(loaders.val, None, args.latent_dim, 'val')
+        inputs_val = next(fetcher_val)
 
         # resume training if necessary
         if args.resume_iter > 0:
@@ -147,18 +147,59 @@ class Solver(nn.Module):
                     wandb.log(all_losses, step=i+1)
 
             # # generate images for debugging
-            # if (i+1) % args.sample_every == 0:
-            #     os.makedirs(args.sample_dir, exist_ok=True)
-            #     utils.debug_image(nets_ema, args, inputs=inputs_val, step=i+1)
+            if (i+1) % args.sample_every == 0:
+                step = i+1
+                os.makedirs(args.sample_dir, exist_ok=True)
+                print(f"\n=== Iter {step}: sampling fixed val batch ===")
+
+                x_fixed = inputs_val.x_src    # Shape [B,4,H,W]
+                # 我们按每个目标域都做一次翻译
+                imgs_to_log = []
+                captions   = []
+                with torch.no_grad():
+                    nets_ema.generator.eval()
+                    nets_ema.style_encoder.eval()
+                    for domain in range(min(args.num_domains, 5)):  # 比如只看前5个域
+                        c_t = torch.full((x_fixed.size(0),), domain,
+                                        dtype=torch.long,
+                                        device=x_fixed.device)
+                        # 1) 用 EMA 的 style_encoder 生成风格向量
+                        s_t = nets_ema.style_encoder(x_fixed, c_t)
+                        # 2) 用 EMA 的 generator 做翻译
+                        x_fake = nets_ema.generator(x_fixed, s_t)  # [B,4,H,W]
+                        # 3) 取 batch 中第一个样本，做 RGGB→RGB，映射到 [0,1]
+                        raw = x_fake[0]  # [4,H,W]
+                        r, gr, gb, b = raw[0], raw[1], raw[2], raw[3]
+                        g = 0.5 * (gr + gb)
+                        rgb = torch.stack([r, g, b], dim=0)      # [3,H,W]
+                        rgb = (rgb + 1) * 0.5                   # → [0,1]
+                        arr = (rgb.permute(1,2,0).cpu().numpy() * 255).astype('uint8')
+                        # 4) 转 PIL.Image 并累积
+                        from PIL import Image
+                        pil = Image.fromarray(arr)
+                        imgs_to_log.append(pil)
+                        captions.append(f"iter{step}_dom{domain}")
+
+                # 5) 上传到 WandB
+                if args.use_wandb:
+                    wandb.log({
+                        "val/fixed_samples": [
+                            wandb.Image(img, caption=cap)
+                            for img, cap in zip(imgs_to_log, captions)
+                        ]
+                    }, step=step)
 
             # save model checkpoints
             if (i+1) % args.save_every == 0:
                 self._save_checkpoint(step=i+1)
 
-            # # compute FID and LPIPS if necessary
+            # # # compute FID and LPIPS if necessary
             # if (i+1) % args.eval_every == 0:
-            #     calculate_metrics(nets_ema, args, i+1, mode='latent')
-            #     calculate_metrics(nets_ema, args, i+1, mode='reference')
+            #     # calculate_metrics(nets_ema, args, i+1, mode='latent')
+            #     # calculate_metrics(nets_ema, args, i+1, mode='reference')
+            #     print(f"\n===Iter {i+1}: running test() ===")
+            #     self.test(step=i+1)
+            #     print(f"---Done test at iter (i+1) ===\n")
 
     @torch.no_grad()
     def sample(self, loaders):
@@ -193,10 +234,13 @@ class Solver(nn.Module):
         return out.clamp_(0, 1)
 
     @torch.no_grad()
-    def test(self):
+    def test(self, step=None):
         """对成对数据进行正向 (O→T) 和 反向 (T→O) 的 MAE / PSNR / SSIM 评估，并保存三联图。"""
         # 1) 恢复 EMA 模型
-        self._load_checkpoint(self.args.resume_iter)
+        if step is None:
+            step = self.args.resume_iter
+
+        self._load_checkpoint(step)
         self.generator_ema.eval()
         self.style_encoder_ema.eval()
 

@@ -23,6 +23,13 @@ from torch.utils.data import DataLoader
 
 import wandb
 
+FIXINPUT={
+    'iphone-x': ['3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy',
+                 '2797.npy', '5890.npy', '3316.npy', '3053.npy', '279.npy',  '588.npy',  '3055.npy', '3310.npy'],
+    'samsung-s9': [ '3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy',
+                    '2797.npy', '5890.npy', '3316.npy', '3053.npy', '279.npy',  '588.npy',  '3055.npy', '3310.npy',]
+}
+
 def str2bool(v):
     return v.lower() in ('true')
 
@@ -61,7 +68,13 @@ def main(args):
                                              img_size=args.img_size,
                                              batch_size=args.batch_size,
                                              prob=args.randcrop_prob,
-                                             num_workers=args.num_workers))
+                                             num_workers=args.num_workers),
+                        val=get_train_loader(root=args.val_img_dir,
+                                             which='source',
+                                             img_size=args.img_size,
+                                             batch_size=args.batch_size,
+                                             prob=args.randcrop_prob,
+                                             fixed_filenames=FIXINPUT))
         solver.train(loaders)
     elif args.mode == 'sample':
         assert len(subdirs(args.src_dir)) == args.num_domains
@@ -207,9 +220,9 @@ if __name__ == '__main__':
 
     # step size
     parser.add_argument('--print_every', type=int, default=10)
-    parser.add_argument('--sample_every', type=int, default=5000)
+    parser.add_argument('--sample_every', type=int, default=1000)
     parser.add_argument('--save_every', type=int, default=10000)
-    parser.add_argument('--eval_every', type=int, default=50000)
+    parser.add_argument('--eval_every', type=int, default=5000)
 
     parser.add_argument('--use_wandb', action='store_true')
 

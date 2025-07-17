@@ -193,13 +193,13 @@ class Solver(nn.Module):
             if (i+1) % args.save_every == 0:
                 self._save_checkpoint(step=i+1)
 
-            # # # compute FID and LPIPS if necessary
-            # if (i+1) % args.eval_every == 0:
-            #     # calculate_metrics(nets_ema, args, i+1, mode='latent')
-            #     # calculate_metrics(nets_ema, args, i+1, mode='reference')
-            #     print(f"\n===Iter {i+1}: running test() ===")
-            #     self.test(step=i+1)
-            #     print(f"---Done test at iter (i+1) ===\n")
+            # # compute FID and LPIPS if necessary
+            if (i+1) % args.eval_every == 0:
+                # calculate_metrics(nets_ema, args, i+1, mode='latent')
+                # calculate_metrics(nets_ema, args, i+1, mode='reference')
+                print(f"\n===Iter {i+1}: running test() ===")
+                self.test(step=i+1)
+                print(f"---Done test at iter (i+1) ===\n")
 
     @torch.no_grad()
     def sample(self, loaders):
@@ -268,7 +268,8 @@ class Solver(nn.Module):
         domain2idx = {d:i for i,d in enumerate(domains)}
 
         # 4) 遍历 paired loader
-        for x_o, x_t, filenames, domain_o_list, domain_t_list in tqdm(self.mydata_loader, desc='Testing'):
+        for batch_i, (x_o, x_t, filenames, domain_o_list, domain_t_list) in enumerate(
+                tqdm(self.mydata_loader, desc='Testing')):
             B = x_o.size(0)
             tot_imgs += B
 
@@ -308,33 +309,61 @@ class Solver(nn.Module):
             tot_ssim_r += ssim_r
 
             # 5) 可视化三联图（每批次最多 5 张）
-            V = min(5, B)
-            for k in range(V):
-                trip_f = torch.stack([
-                    rggb2rgb(x_o_den[k]),
-                    rggb2rgb(x_pred_den[k]),
-                    rggb2rgb(x_t_den[k])
-                ], dim=0)
-                save_image(trip_f,
-                           f"{self.args.result_dir}/batch_{k:03d}_fwd.png",
-                           nrow=3)
+            V = min(1, B)
+            if self.args.use_wandb:
+                for k in range(V):
+                    trip_f = torch.stack([
+                        rggb2rgb(x_o_den[k]),
+                        rggb2rgb(x_pred_den[k]),
+                        rggb2rgb(x_t_den[k])
+                    ], dim=0)
+                    save_image(trip_f,
+                               f"{self.args.result_dir}/batch{batch_i:03d}_idx{k:03d}_fwd.png",
+                               nrow=3)
 
-                trip_r = torch.stack([
-                    rggb2rgb(x_t_den[k]),
-                    rggb2rgb(x_rev_den[k]),
-                    rggb2rgb(x_o_den[k])
-                ], dim=0)
-                save_image(trip_r,
-                           f"{self.args.result_dir}/batch_{k:03d}_rev.png",
-                           nrow=3)
+                    trip_r = torch.stack([
+                        rggb2rgb(x_t_den[k]),
+                        rggb2rgb(x_rev_den[k]),
+                        rggb2rgb(x_o_den[k])
+                    ], dim=0)
+                    save_image(trip_r,
+                               f"{self.args.result_dir}/batch{batch_i:03d}_idx{k:03d}_rev.png",
+                               nrow=3)
 
-        # 6) 打印平均指标
-        print(f'Forward  MAE:{tot_mae_f/tot_imgs:.4f}, '
-              f'PSNR:{tot_psnr_f/tot_imgs:.2f}, '
-              f'SSIM:{tot_ssim_f/tot_imgs:.4f}')
-        print(f'Reverse  MAE:{tot_mae_r/tot_imgs:.4f}, '
-              f'PSNR:{tot_psnr_r/tot_imgs:.2f}, '
-              f'SSIM:{tot_ssim_r/tot_imgs:.4f}')
+        avg_mae_f  = tot_mae_f  / tot_imgs
+        avg_psnr_f = tot_psnr_f / tot_imgs
+        avg_ssim_f = tot_ssim_f / tot_imgs
+        avg_mae_r  = tot_mae_r  / tot_imgs
+        avg_psnr_r = tot_psnr_r / tot_imgs
+        avg_ssim_r = tot_ssim_r / tot_imgs
+
+        avg_mae = avg_mae_f + avg_mae_r / 2
+        avg_ssim = avg_ssim_f + avg_ssim_r / 2
+        avg_psnr = avg_psnr_f + avg_psnr_r / 2
+
+        print(f'Forward  MAE:{avg_mae_f:.4f}, '
+              f'PSNR:{avg_psnr_f:.2f}, '
+              f'SSIM:{avg_ssim_f:.4f}')
+        print(f'Reverse  MAE:{avg_mae_r:.4f}, '
+              f'PSNR:{avg_psnr_r:.2f}, '
+              f'SSIM:{avg_ssim_r:.4f}')
+        print(f'Avg  MAE:{avg_mae:.4f}, '
+              f'PSNR:{avg_psnr:.2f}, '
+              f'SSIM:{avg_ssim:.4f}')
+
+        if self.args.use_wandb:
+            import wandb
+            wandb.log({
+                'Test/MAE_forward':  avg_mae_f,
+                'Test/PSNR_forward': avg_psnr_f,
+                'Test/SSIM_forward': avg_ssim_f,
+                'Test/MAE_reverse':  avg_mae_r,
+                'Test/PSNR_reverse': avg_psnr_r,
+                'Test/SSIM_reverse': avg_ssim,
+                'Test/MAE': avg_mae,
+                'Test/PSNR': avg_psnr,
+                'Test/SSIM': avg_ssim_r,
+            }, step=step)
 
 
 def compute_d_loss(nets, args, x_real, y_org, y_trg, z_trg=None, x_ref=None, masks=None):

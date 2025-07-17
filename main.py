@@ -56,7 +56,7 @@ def main(args):
 
     if args.mode == 'train':
         assert len(subdirs(args.train_img_dir)) == args.num_domains
-        assert len(subdirs(args.val_img_dir)) == args.num_domains
+        assert len(subdirs(args.sample_dir)) == args.num_domains
         loaders = Munch(src=get_train_loader(root=args.train_img_dir,
                                              which='source',
                                              img_size=args.img_size,
@@ -69,12 +69,32 @@ def main(args):
                                              batch_size=args.batch_size,
                                              prob=args.randcrop_prob,
                                              num_workers=args.num_workers),
-                        val=get_train_loader(root=args.val_img_dir,
+                        val=get_train_loader(root=args.sample_dir,
                                              which='source',
                                              img_size=args.img_size,
                                              batch_size=args.batch_size,
                                              prob=args.randcrop_prob,
                                              fixed_filenames=FIXINPUT))
+        transform = transforms.Compose([
+            transforms.Resize([args.img_size, args.img_size]),
+            transforms.Normalize(mean=[0.5,0.5,0.5,0.5],
+                                 std =[0.5,0.5,0.5,0.5]),
+        ])
+        paired_ds = PairedNpyDataset(
+            root      = args.val_img_dir,
+            domain_o  = args.domain_o,
+            domain_t  = args.domain_t,
+            transform = transform
+        )
+        paired_loader = DataLoader(
+            paired_ds,
+            batch_size   = args.val_batch_size,
+            shuffle      = False,
+            num_workers  = args.num_workers,
+            pin_memory   = True
+        )
+
+        solver.mydata_loader = paired_loader
         solver.train(loaders)
     elif args.mode == 'sample':
         assert len(subdirs(args.src_dir)) == args.num_domains
@@ -187,9 +207,9 @@ if __name__ == '__main__':
     # directory for training
     parser.add_argument('--train_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
                         help='Directory containing training images')
-    parser.add_argument('--val_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
+    parser.add_argument('--val_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/test',
                         help='Directory containing validation images')
-    parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/samples',
+    parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
                         help='Directory for saving generated images')
     parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/checkpoints',
                         help='Directory for saving network checkpoints')

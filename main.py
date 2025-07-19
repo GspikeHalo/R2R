@@ -1,144 +1,250 @@
+"""
+StarGAN v2
+Copyright (c) 2020-present NAVER Corp.
+
+This work is licensed under the Creative Commons Attribution-NonCommercial
+4.0 International License. To view a copy of this license, visit
+http://creativecommons.org/licenses/by-nc/4.0/ or send a letter to
+Creative Commons, PO Box 1866, Mountain View, CA 94042, USA.
+"""
+
 import os
 import argparse
-from solver import Solver
-from data_loader import get_loader
+
+from munch import Munch
 from torch.backends import cudnn
+import torch
+
+from core.data_loader import get_train_loader, PairedNpyDataset
+from core.data_loader import get_test_loader
+from core.solver import Solver
+from torchvision import transforms
+from torch.utils.data import DataLoader
+
 import wandb
+
+FIXINPUT={
+    'iphone-x': ['3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy',
+                 '2797.npy', '5890.npy', '3316.npy', '3053.npy', '279.npy',  '588.npy',  '3055.npy', '3310.npy'],
+    'samsung-s9': [ '3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy',
+                    '2797.npy', '5890.npy', '3316.npy', '3053.npy', '279.npy',  '588.npy',  '3055.npy', '3310.npy',]
+}
 
 def str2bool(v):
     return v.lower() in ('true')
 
-def main(config):
+
+def subdirs(dname):
+    return [d for d in os.listdir(dname)
+            if os.path.isdir(os.path.join(dname, d))]
+
+
+def main(args):
+    print(args)
     cudnn.benchmark = True
+    torch.manual_seed(args.seed)
 
-    if not os.path.exists(config.log_dir):
-        os.makedirs(config.log_dir)
-    if not os.path.exists(config.model_save_dir):
-        os.makedirs(config.model_save_dir)
-    if not os.path.exists(config.sample_dir):
-        os.makedirs(config.sample_dir)
-    if not os.path.exists(config.result_dir):
-        os.makedirs(config.result_dir)
+    if args.use_wandb:
+        wandb.init(
+            project='StarGAN-R2R',
+            entity='bias-lab',
+            config=vars(args),
+            name="stargan-v2_test"
+        )
 
-    mydata_loader = get_loader(
-        config.mydata_image_dir,
-        config.mydata_attr_path,
-        config.selected_attrs,
-        config.mydata_crop_size,
-        config.image_size,
-        config.batch_size,
-        config.mode,
-        config.num_workers
-    )
+    solver = Solver(args)
 
-    solver = Solver(mydata_loader, None, config)
+    if args.mode == 'train':
+        assert len(subdirs(args.train_img_dir)) == args.num_domains
+        assert len(subdirs(args.sample_dir)) == args.num_domains
+        loaders = Munch(src=get_train_loader(root=args.train_img_dir,
+                                             which='source',
+                                             img_size=args.img_size,
+                                             batch_size=args.batch_size,
+                                             prob=args.randcrop_prob,
+                                             num_workers=args.num_workers),
+                        ref=get_train_loader(root=args.train_img_dir,
+                                             which='reference',
+                                             img_size=args.img_size,
+                                             batch_size=args.batch_size,
+                                             prob=args.randcrop_prob,
+                                             num_workers=args.num_workers),
+                        val=get_train_loader(root=args.sample_dir,
+                                             which='source',
+                                             img_size=args.img_size,
+                                             batch_size=args.batch_size,
+                                             prob=args.randcrop_prob,
+                                             fixed_filenames=FIXINPUT))
+        transform = transforms.Compose([
+            transforms.Resize([args.img_size, args.img_size]),
+            transforms.Normalize(mean=[0.5,0.5,0.5,0.5],
+                                 std =[0.5,0.5,0.5,0.5]),
+        ])
+        paired_ds = PairedNpyDataset(
+            root      = args.val_img_dir,
+            domain_o  = args.domain_o,
+            domain_t  = args.domain_t,
+            transform = transform
+        )
+        paired_loader = DataLoader(
+            paired_ds,
+            batch_size   = args.val_batch_size,
+            shuffle      = False,
+            num_workers  = args.num_workers,
+            pin_memory   = True
+        )
 
-    wandb.init(
-        project="StarGAN-R2R",
-        config={
-            "g_lr":       solver.g_lr,
-            "d_lr":       solver.d_lr,
-            "batch_size": solver.batch_size,
-            "num_iters":  solver.num_iters,
-            "lambda_cls": solver.lambda_cls,
-            "lambda_rec": solver.lambda_rec,
-            "lambda_gp":  solver.lambda_gp,
-            "n_critic":   solver.n_critic,
-        }
-    )
+        solver.mydata_loader = paired_loader
+        solver.train(loaders)
+    elif args.mode == 'sample':
+        assert len(subdirs(args.src_dir)) == args.num_domains
+        assert len(subdirs(args.ref_dir)) == args.num_domains
+        loaders = Munch(src=get_test_loader(root=args.src_dir,
+                                            img_size=args.img_size,
+                                            batch_size=args.val_batch_size,
+                                            shuffle=False,
+                                            num_workers=args.num_workers),
+                        ref=get_test_loader(root=args.ref_dir,
+                                            img_size=args.img_size,
+                                            batch_size=args.val_batch_size,
+                                            shuffle=False,
+                                            num_workers=args.num_workers))
+        solver.sample(loaders)
+    elif args.mode == 'eval':
+        transform = transforms.Compose([
+            transforms.Resize([args.img_size, args.img_size]),
+            transforms.Normalize(mean=[0.5,0.5,0.5,0.5],
+                                 std =[0.5,0.5,0.5,0.5]),
+        ])
+        paired_ds = PairedNpyDataset(
+            root      = args.val_img_dir,
+            domain_o  = args.domain_o,
+            domain_t  = args.domain_t,
+            transform = transform
+        )
+        paired_loader = DataLoader(
+            paired_ds,
+            batch_size   = args.val_batch_size,
+            shuffle      = False,
+            num_workers  = args.num_workers,
+            pin_memory   = True
+        )
 
-    if config.mode == 'train':
-        solver.train()
-    else:
+        solver.mydata_loader = paired_loader
         solver.test()
+    elif args.mode == 'align':
+        from core.wing import align_faces
+        align_faces(args, args.inp_dir, args.out_dir)
+    else:
+        raise NotImplementedError
+
+    if args.use_wandb:
+        wandb.finish()
+
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train or test StarGAN on MyData')
+    parser = argparse.ArgumentParser()
 
-    # Model configuration
-    parser.add_argument('--c_dim', type=int, default=2,
-                        help='dimension of domain labels for MyData')
-    parser.add_argument('--mydata_crop_size', type=int, default=256,
-                        help='crop size for MyData images')
-    parser.add_argument('--image_size', type=int, default=256,
-                        help='input image resolution')
-    parser.add_argument('--g_conv_dim', type=int, default=64,
-                        help='number of conv filters in first layer of G')
-    parser.add_argument('--d_conv_dim', type=int, default=64,
-                        help='number of conv filters in first layer of D')
-    parser.add_argument('--g_repeat_num', type=int, default=6,
-                        help='number of residual blocks in G')
-    parser.add_argument('--d_repeat_num', type=int, default=6,
-                        help='number of strided conv layers in D')
-    parser.add_argument('--lambda_cls', type=float, default=1,
-                        help='weight for domain classification loss')
-    parser.add_argument('--lambda_rec', type=float, default=10,
-                        help='weight for reconstruction loss')
-    parser.add_argument('--lambda_gp', type=float, default=10,
-                        help='weight for gradient penalty')
+    # model arguments
+    parser.add_argument('--img_size', type=int, default=256,
+                        help='Image resolution')
+    parser.add_argument('--num_domains', type=int, default=2,
+                        help='Number of domains')
+    parser.add_argument('--latent_dim', type=int, default=16,
+                        help='Latent vector dimension')
+    parser.add_argument('--hidden_dim', type=int, default=512,
+                        help='Hidden dimension of mapping network')
+    parser.add_argument('--style_dim', type=int, default=64,
+                        help='Style code dimension')
 
-    # Training configuration
-    parser.add_argument('--batch_size', type=int, default=16,
-                        help='mini-batch size')
-    parser.add_argument('--num_iters', type=int, default=200000,
-                        help='total iterations for training D')
-    parser.add_argument('--num_iters_decay', type=int, default=100000,
-                        help='iterations to start decaying learning rate')
-    parser.add_argument('--g_lr', type=float, default=0.0001,
-                        help='learning rate for G')
-    parser.add_argument('--d_lr', type=float, default=0.0001,
-                        help='learning rate for D')
-    parser.add_argument('--n_critic', type=int, default=5,
-                        help='number of D updates per G update')
-    parser.add_argument('--beta1', type=float, default=0.5,
-                        help='Adam beta1')
-    parser.add_argument('--beta2', type=float, default=0.999,
-                        help='Adam beta2')
-    parser.add_argument('--resume_iters', type=int, default=None,
-                        help='iteration to resume training from')
-    parser.add_argument('--selected_attrs', nargs='+',
-                        default=['cameraA', 'cameraB'],
-                        help='list of attributes for MyData')
+    # weight for objective functions
+    parser.add_argument('--lambda_reg', type=float, default=1,
+                        help='Weight for R1 regularization')
+    parser.add_argument('--lambda_cyc', type=float, default=10,
+                        help='Weight for cyclic consistency loss')
+    parser.add_argument('--lambda_sty', type=float, default=1,
+                        help='Weight for style reconstruction loss')
+    parser.add_argument('--lambda_ds', type=float, default=5,
+                        help='Weight for diversity sensitive loss')
+    parser.add_argument('--ds_iter', type=int, default=100000,
+                        help='Number of iterations to optimize diversity sensitive loss')
+    parser.add_argument('--w_hpf', type=float, default=0,
+                        help='weight for high-pass filtering')
 
-    # Test configuration
-    parser.add_argument('--test_iters', type=int, default=200000,
-                        help='iteration to load model for testing')
+    # training arguments
+    parser.add_argument('--randcrop_prob', type=float, default=0.5,
+                        help='Probabilty of using random-resized cropping')
+    parser.add_argument('--total_iters', type=int, default=100000,
+                        help='Number of total iterations')
+    parser.add_argument('--resume_iter', type=int, default=95000,
+                        help='Iterations to resume training/testing')
+    parser.add_argument('--batch_size', type=int, default=8,
+                        help='Batch size for training')
+    parser.add_argument('--val_batch_size', type=int, default=32,
+                        help='Batch size for validation')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                        help='Learning rate for D, E and G')
+    parser.add_argument('--f_lr', type=float, default=1e-6,
+                        help='Learning rate for F')
+    parser.add_argument('--beta1', type=float, default=0.0,
+                        help='Decay rate for 1st moment of Adam')
+    parser.add_argument('--beta2', type=float, default=0.99,
+                        help='Decay rate for 2nd moment of Adam')
+    parser.add_argument('--weight_decay', type=float, default=1e-4,
+                        help='Weight decay for optimizer')
+    parser.add_argument('--num_outs_per_domain', type=int, default=10,
+                        help='Number of generated images per domain during sampling')
 
-    # Miscellaneous
-    parser.add_argument('--num_workers', type=int, default=1,
-                        help='number of data loader workers')
-    parser.add_argument('--mode', type=str, default='train',
-                        choices=['train', 'test'],
-                        help='mode: train or test')
-    parser.add_argument('--use_tensorboard', type=str2bool, default=True,
-                        help='whether to use TensorBoard')
+    # misc
+    parser.add_argument('--mode', type=str, required=True,
+                        choices=['train', 'sample', 'eval', 'align'],
+                        help='This argument is used in solver')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='Number of workers used in DataLoader')
+    parser.add_argument('--seed', type=int, default=777,
+                        help='Seed for random number generator')
 
-    # Directories
-    parser.add_argument('--mydata_image_dir', type=str,
-                        default='data/mydata/images',
-                        help='directory for MyData images')
-    parser.add_argument('--mydata_attr_path', type=str,
-                        default='data/mydata/list_attr_mydata.txt',
-                        help='path to MyData attribute file')
-    parser.add_argument('--log_dir', type=str, default='mydata/logs',
-                        help='directory to save training logs')
-    parser.add_argument('--model_save_dir', type=str, default='mydata/models',
-                        help='directory to save model checkpoints')
-    parser.add_argument('--sample_dir', type=str, default='mydata/samples',
-                        help='directory to save sample images during training')
-    parser.add_argument('--result_dir', type=str, default='mydata/results',
-                        help='directory to save test results')
+    # directory for training
+    parser.add_argument('--train_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
+                        help='Directory containing training images')
+    parser.add_argument('--val_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/test',
+                        help='Directory containing validation images')
+    parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
+                        help='Directory for saving generated images')
+    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/checkpoints',
+                        help='Directory for saving network checkpoints')
 
-    # Step intervals
-    parser.add_argument('--log_step', type=int, default=10,
-                        help='interval for logging')
-    parser.add_argument('--sample_step', type=int, default=1000,
-                        help='interval for saving sample images')
-    parser.add_argument('--model_save_step', type=int, default=10000,
-                        help='interval for saving model checkpoints')
-    parser.add_argument('--lr_update_step', type=int, default=1000,
-                        help='interval for updating learning rate')
+    # directory for calculating metrics
+    parser.add_argument('--eval_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/eval',
+                        help='Directory for saving metrics, i.e., FID and LPIPS')
 
-    config = parser.parse_args()
-    print(config)
-    main(config)
+    # directory for testing
+    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/results',
+                        help='Directory for saving generated images and videos')
+    parser.add_argument('--src_dir', type=str, default='assets/representative/celeba_hq/src',
+                        help='Directory containing input source images')
+    parser.add_argument('--ref_dir', type=str, default='assets/representative/celeba_hq/ref',
+                        help='Directory containing input reference images')
+    parser.add_argument('--domain_o', type=str, default='//media/Data_2/R2RResult/processed/starganV2/test/iphone-x',
+                        help = 'Original domain name under val_img_dir for paired test')
+    parser.add_argument('--domain_t', type=str, default='/media/Data_2/R2RResult/processed/starganV2/test/samsung-s9',
+                        help = 'Target   domain name under val_img_dir for paired test')
+    # parser.add_argument('--inp_dir', type=str, default='assets/representative/custom/female',
+    #                     help='input directory when aligning faces')
+    # parser.add_argument('--out_dir', type=str, default='assets/representative/celeba_hq/src/female',
+    #                     help='output directory when aligning faces')
+
+    # face alignment
+    parser.add_argument('--wing_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/checkpoints/wing.ckpt')
+    parser.add_argument('--lm_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/checkpoints/celeba_lm_mean.npz')
+
+    # step size
+    parser.add_argument('--print_every', type=int, default=10)
+    parser.add_argument('--sample_every', type=int, default=1000)
+    parser.add_argument('--save_every', type=int, default=5000)
+    parser.add_argument('--eval_every', type=int, default=5000)
+
+    parser.add_argument('--use_wandb', action='store_true')
+
+    args = parser.parse_args()
+    main(args)

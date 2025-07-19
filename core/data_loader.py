@@ -1,0 +1,289 @@
+"""
+StarGAN v2
+Copyright (c) 2020-present NAVER Corp.
+
+This work is licensed under the Creative Commons Attribution-NonCommercial
+4.0 International License. To view a copy of this license, visit
+http://creativecommons.org/licenses/by-nc/4.0/ or send a letter to
+Creative Commons, PO Box 1866, Mountain View, CA 94042, USA.
+"""
+
+from pathlib import Path
+from itertools import chain
+import os
+import random
+
+from munch import Munch
+from PIL import Image
+import numpy as np
+
+import torch
+from torch.utils import data
+from torch.utils.data.sampler import WeightedRandomSampler
+from torchvision import transforms
+from torchvision.datasets import ImageFolder
+
+
+def listdir(dname):
+    fnames = list(Path(dname).rglob('*.npy'))
+    fnames.sort()
+    return fnames
+
+
+class DefaultDataset(data.Dataset):
+    def __init__(self, root, transform=None):
+        self.samples = listdir(root)
+        self.samples.sort()
+        self.transform = transform
+        self.targets = None
+
+    def __getitem__(self, index):
+        fname = self.samples[index]
+        arr = np.load(str(fname))
+        img = torch.from_numpy(arr).float()
+        if self.transform is not None:
+            img = self.transform(img)
+        return img
+
+    def __len__(self):
+        return len(self.samples)
+
+class NpyFolder(data.Dataset):
+    def __init__(self, root, transform=None, fixed_filenames=None):
+        root = Path(root)
+        classes = sorted(p.name for p in root.iterdir() if p.is_dir())
+        self.class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
+        samples = []
+        for cls in classes:
+            cls_dir = root / cls
+            for fn in cls_dir.rglob('*.npy'):
+                name = fn.name
+                if fixed_filenames is not None:
+                    allow_list = fixed_filenames.get(cls, [])
+                    if (name not in allow_list) and (Path(name).stem not in allow_list):
+                        continue
+                samples.append((fn, self.class_to_idx[cls]))
+        self.samples = samples
+        self.targets = [label for _, label in samples]
+        self.transform = transform
+
+    def __getitem__(self, index):
+        path, label = self.samples[index]
+        arr = np.load(str(path))               # shape (4, H, W) or similar
+        img = torch.from_numpy(arr).float()    # convert to float tensor
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+    def __len__(self):
+        return len(self.samples)
+
+class ReferenceDataset(data.Dataset):
+    def __init__(self, root, transform=None):
+        self.root = root
+        self.transform = transform
+        self.samples, self.targets = self._make_dataset(root)
+
+    def _make_dataset(self, root):
+        domains = sorted(os.listdir(root))
+        fnames1, fnames2, labels = [], [], []
+        for idx, domain in enumerate(domains):
+            class_dir = os.path.join(root, domain)
+            if not os.path.isdir(class_dir):
+                continue
+            files = [f for f in os.listdir(class_dir) if f.endswith('.npy')]
+            paths = [os.path.join(class_dir, f) for f in files]
+            if len(paths) == 0:
+                continue
+            fnames1 += paths
+            fnames2 += random.sample(paths, len(paths))
+            labels += [idx] * len(paths)
+        return list(zip(fnames1, fnames2)), labels
+
+    def __getitem__(self, index):
+        path1, path2 = self.samples[index]
+        label = self.targets[index]
+        arr1 = np.load(path1)
+        arr2 = np.load(path2)
+        img1 = torch.from_numpy(arr1).float()
+        img2 = torch.from_numpy(arr2).float()
+        if self.transform is not None:
+            img1 = self.transform(img1)
+            img2 = self.transform(img2)
+        return img1, img2, label
+
+    def __len__(self):
+        return len(self.targets)
+
+
+def _make_balanced_sampler(labels):
+    class_counts = np.bincount(labels)
+    class_weights = 1. / class_counts
+    weights = class_weights[labels]
+    return WeightedRandomSampler(weights, len(weights))
+
+
+def get_train_loader(root, which='source', img_size=256,
+                     batch_size=8, prob=0.5, num_workers=4, fixed_filenames=None):
+    print('Preparing DataLoader to fetch %s images '
+          'during the training phase...' % which)
+
+    crop = transforms.RandomResizedCrop(
+        img_size, scale=[0.8, 1.0], ratio=[0.9, 1.1])
+    rand_crop = transforms.Lambda(
+        lambda x: crop(x) if random.random() < prob else x)
+
+    transform = transforms.Compose([
+        rand_crop,
+        transforms.Resize([img_size, img_size]),
+        transforms.RandomHorizontalFlip(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
+                             std=[0.5, 0.5, 0.5, 0.5]),
+    ])
+
+    if which == 'source':
+        dataset = NpyFolder(root, transform, fixed_filenames)
+    elif which == 'reference':
+        dataset = ReferenceDataset(root, transform)
+    else:
+        raise NotImplementedError
+
+    sampler = _make_balanced_sampler(dataset.targets)
+    return data.DataLoader(dataset=dataset,
+                           batch_size=batch_size,
+                           sampler=sampler,
+                           num_workers=num_workers,
+                           pin_memory=True,
+                           drop_last=True)
+
+
+def get_eval_loader(root, img_size=256, batch_size=32,
+                    imagenet_normalize=True, shuffle=True,
+                    num_workers=4, drop_last=False):
+    print('Preparing DataLoader for the evaluation phase...')
+    if imagenet_normalize:
+        height, width = 299, 299
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+    else:
+        height, width = img_size, img_size
+        mean = [0.5, 0.5, 0.5]
+        std = [0.5, 0.5, 0.5]
+
+    transform = transforms.Compose([
+        transforms.Resize([img_size, img_size]),
+        transforms.Resize([height, width]),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std)
+    ])
+
+    dataset = DefaultDataset(root, transform=transform)
+    return data.DataLoader(dataset=dataset,
+                           batch_size=batch_size,
+                           shuffle=shuffle,
+                           num_workers=num_workers,
+                           pin_memory=True,
+                           drop_last=drop_last)
+
+
+def get_test_loader(root, img_size=256, batch_size=32,
+                    shuffle=True, num_workers=4):
+    print('Preparing DataLoader for the generation phase (4-ch npy)...')
+    transform = transforms.Compose([
+        transforms.Resize([img_size, img_size]),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
+                             std =[0.5, 0.5, 0.5, 0.5]),
+    ])
+
+    dataset = NpyFolder(root, transform=transform)
+
+    return data.DataLoader(dataset=dataset,
+                      batch_size=batch_size,
+                      shuffle=shuffle,
+                      num_workers=num_workers,
+                      pin_memory=True)
+
+class InputFetcher:
+    def __init__(self, loader, loader_ref=None, latent_dim=16, mode=''):
+        self.loader = loader
+        self.loader_ref = loader_ref
+        self.latent_dim = latent_dim
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.mode = mode
+
+    def _fetch_inputs(self):
+        try:
+            x, y = next(self.iter)
+        except (AttributeError, StopIteration):
+            self.iter = iter(self.loader)
+            x, y = next(self.iter)
+        return x, y
+
+    def _fetch_refs(self):
+        try:
+            x, x2, y = next(self.iter_ref)
+        except (AttributeError, StopIteration):
+            self.iter_ref = iter(self.loader_ref)
+            x, x2, y = next(self.iter_ref)
+        return x, x2, y
+
+    def __next__(self):
+        x, y = self._fetch_inputs()
+        if self.mode == 'train':
+            x_ref, x_ref2, y_ref = self._fetch_refs()
+            inputs = Munch(x_src=x, y_src=y, y_ref=y_ref,
+                           x_ref=x_ref, x_ref2=x_ref2)
+        elif self.mode == 'val':
+            x_ref, y_ref = self._fetch_inputs()
+            inputs = Munch(x_src=x, y_src=y,
+                           x_ref=x_ref, y_ref=y_ref)
+        elif self.mode == 'test':
+            inputs = Munch(x=x, y=y)
+        else:
+            raise NotImplementedError
+
+        return Munch({k: v.to(self.device)
+                      for k, v in inputs.items()})
+
+class PairedNpyDataset(data.Dataset):
+    """
+    返回 (img_o, img_t, filename, domain_o, domain_t)
+    """
+    def __init__(self, root: str, domain_o: str, domain_t: str, transform=None):
+        self.root     = Path(root)
+        self.domain_o = domain_o
+        self.domain_t = domain_t
+        self.transform = transform
+
+        self.dir_o = self.root / domain_o
+        self.dir_t = self.root / domain_t
+
+        # 找到两个域中都存在的 .npy 文件名
+        files_o = set(p.name for p in self.dir_o.glob('*.npy'))
+        files_t = set(p.name for p in self.dir_t.glob('*.npy'))
+        common = sorted(files_o & files_t)
+        if not common:
+            raise RuntimeError(f'No common files between {domain_o} and {domain_t}')
+
+        # 构造成对路径
+        self.pairs = [
+            (self.dir_o / fname, self.dir_t / fname)
+            for fname in common
+        ]
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        path_o, path_t = self.pairs[idx]
+        arr_o = np.load(str(path_o))     # (4, H, W)
+        arr_t = np.load(str(path_t))
+        img_o = torch.from_numpy(arr_o).float()
+        img_t = torch.from_numpy(arr_t).float()
+
+        if self.transform:
+            img_o = self.transform(img_o)
+            img_t = self.transform(img_t)
+        domain_o_name = Path(self.domain_o).name
+        domain_t_name = Path(self.domain_t).name
+        return img_o, img_t, path_o.name, domain_o_name, domain_t_name

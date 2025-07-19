@@ -77,8 +77,30 @@ class AdaIN(nn.Module):
         gamma, beta = torch.chunk(h, chunks=2, dim=1)
         return (1 + gamma) * self.norm(x) + beta
 
+class ModulatedConv2d(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, style_dim, demodulate=True, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.demodulate = demodulate
+        self.weight = nn.Parameter(torch.randn(1, out_ch, in_ch, kernel_size, kernel_size))
+        self.style_fc = nn.Linear(style_dim, in_ch)
+        self.padding = kernel_size // 2
 
-class AdainResBlk(nn.Module):
+    def forward(self, x, s):
+        # x: [B, in_ch, H, W], s: [B, style_dim]
+        B, C, H, W = x.shape
+        style = self.style_fc(s).view(B, 1, C, 1, 1)
+        w = self.weight * (style + 1)
+        if self.demodulate:
+            d = torch.rsqrt((w**2).sum([2,3,4]) + self.eps)  # [B, out_ch]
+            w = w * d.view(B, -1, 1, 1, 1)
+        x = x.view(1, -1, H, W)
+        w = w.view(B * w.shape[1], w.shape[2], w.shape[3], w.shape[4])
+        out = F.conv2d(x, w, padding=self.padding, groups=B)
+        out = out.view(B, -1, H, W)
+        return out
+
+class ModulatedResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, style_dim=64, w_hpf=0,
                  actv=nn.LeakyReLU(0.2), upsample=False):
         super().__init__()
@@ -88,11 +110,9 @@ class AdainResBlk(nn.Module):
         self.learned_sc = dim_in != dim_out
         self._build_weights(dim_in, dim_out, style_dim)
 
-    def _build_weights(self, dim_in, dim_out, style_dim=64):
-        self.conv1 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
-        self.conv2 = nn.Conv2d(dim_out, dim_out, 3, 1, 1)
-        self.norm1 = AdaIN(style_dim, dim_in)
-        self.norm2 = AdaIN(style_dim, dim_out)
+    def _build_weights(self, dim_in, dim_out, style_dim):
+        self.conv1 = ModulatedConv2d(dim_in, dim_out, 3, style_dim, demodulate=True)
+        self.conv2 = ModulatedConv2d(dim_out, dim_out, 3, style_dim, demodulate=True)
         if self.learned_sc:
             self.conv1x1 = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=False)
 
@@ -104,14 +124,12 @@ class AdainResBlk(nn.Module):
         return x
 
     def _residual(self, x, s):
-        x = self.norm1(x, s)
         x = self.actv(x)
         if self.upsample:
             x = F.interpolate(x, scale_factor=2, mode='nearest')
-        x = self.conv1(x)
-        x = self.norm2(x, s)
+        x = self.conv1(x, s)
         x = self.actv(x)
-        x = self.conv2(x)
+        x = self.conv2(x, s)
         return x
 
     def forward(self, x, s):
@@ -156,7 +174,7 @@ class Generator(nn.Module):
             self.encode.append(
                 ResBlk(dim_in, dim_out, normalize=True, downsample=True))
             self.decode.insert(
-                0, AdainResBlk(dim_out, dim_in, style_dim,
+                0, ModulatedResBlk(dim_out, dim_in, style_dim,
                                w_hpf=w_hpf, upsample=True))  # stack-like
             dim_in = dim_out
 
@@ -165,7 +183,7 @@ class Generator(nn.Module):
             self.encode.append(
                 ResBlk(dim_out, dim_out, normalize=True))
             self.decode.insert(
-                0, AdainResBlk(dim_out, dim_out, style_dim, w_hpf=w_hpf))
+                0, ModulatedResBlk(dim_out, dim_out, style_dim, w_hpf=w_hpf))
 
         if w_hpf > 0:
             device = torch.device(

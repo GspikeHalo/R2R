@@ -49,7 +49,7 @@ class DefaultDataset(data.Dataset):
         return len(self.samples)
 
 class NpyFolder(data.Dataset):
-    def __init__(self, root, transform=None):
+    def __init__(self, root, transform=None, fixed_filenames=None):
         root = Path(root)
         classes = sorted(p.name for p in root.iterdir() if p.is_dir())
         self.class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
@@ -57,6 +57,11 @@ class NpyFolder(data.Dataset):
         for cls in classes:
             cls_dir = root / cls
             for fn in cls_dir.rglob('*.npy'):
+                name = fn.name
+                if fixed_filenames is not None:
+                    allow_list = fixed_filenames.get(cls, [])
+                    if (name not in allow_list) and (Path(name).stem not in allow_list):
+                        continue
                 samples.append((fn, self.class_to_idx[cls]))
         self.samples = samples
         self.targets = [label for _, label in samples]
@@ -119,7 +124,7 @@ def _make_balanced_sampler(labels):
 
 
 def get_train_loader(root, which='source', img_size=256,
-                     batch_size=8, prob=0.5, num_workers=4):
+                     batch_size=8, prob=0.5, num_workers=4, fixed_filenames=None):
     print('Preparing DataLoader to fetch %s images '
           'during the training phase...' % which)
 
@@ -137,7 +142,7 @@ def get_train_loader(root, which='source', img_size=256,
     ])
 
     if which == 'source':
-        dataset = NpyFolder(root, transform)
+        dataset = NpyFolder(root, transform, fixed_filenames=None)
     elif which == 'reference':
         dataset = ReferenceDataset(root, transform)
     else:

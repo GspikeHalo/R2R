@@ -23,6 +23,13 @@ from torch.utils.data import DataLoader
 
 import wandb
 
+FIXINPUT={
+    'iphone-x': ['3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy',
+                 '2797.npy', '5890.npy', '3316.npy', '3053.npy', '279.npy',  '588.npy',  '3055.npy', '3310.npy'],
+    'samsung-s9': [ '3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy',
+                    '2797.npy', '5890.npy', '3316.npy', '3053.npy', '279.npy',  '588.npy',  '3055.npy', '3310.npy',]
+}
+
 def str2bool(v):
     return v.lower() in ('true')
 
@@ -49,7 +56,7 @@ def main(args):
 
     if args.mode == 'train':
         assert len(subdirs(args.train_img_dir)) == args.num_domains
-        assert len(subdirs(args.val_img_dir)) == args.num_domains
+        assert len(subdirs(args.sample_dir)) == args.num_domains
         loaders = Munch(src=get_train_loader(root=args.train_img_dir,
                                              which='source',
                                              img_size=args.img_size,
@@ -61,7 +68,33 @@ def main(args):
                                              img_size=args.img_size,
                                              batch_size=args.batch_size,
                                              prob=args.randcrop_prob,
-                                             num_workers=args.num_workers))
+                                             num_workers=args.num_workers),
+                        val=get_train_loader(root=args.sample_dir,
+                                             which='source',
+                                             img_size=args.img_size,
+                                             batch_size=args.batch_size,
+                                             prob=args.randcrop_prob,
+                                             fixed_filenames=FIXINPUT))
+        transform = transforms.Compose([
+            transforms.Resize([args.img_size, args.img_size]),
+            transforms.Normalize(mean=[0.5,0.5,0.5,0.5],
+                                 std =[0.5,0.5,0.5,0.5]),
+        ])
+        paired_ds = PairedNpyDataset(
+            root      = args.val_img_dir,
+            domain_o  = args.domain_o,
+            domain_t  = args.domain_t,
+            transform = transform
+        )
+        paired_loader = DataLoader(
+            paired_ds,
+            batch_size   = args.val_batch_size,
+            shuffle      = False,
+            num_workers  = args.num_workers,
+            pin_memory   = True
+        )
+
+        solver.mydata_loader = paired_loader
         solver.train(loaders)
     elif args.mode == 'sample':
         assert len(subdirs(args.src_dir)) == args.num_domains
@@ -174,19 +207,19 @@ if __name__ == '__main__':
     # directory for training
     parser.add_argument('--train_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
                         help='Directory containing training images')
-    parser.add_argument('--val_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
+    parser.add_argument('--val_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/test',
                         help='Directory containing validation images')
-    parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/samples',
+    parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
                         help='Directory for saving generated images')
-    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/checkpoints',
                         help='Directory for saving network checkpoints')
 
     # directory for calculating metrics
-    parser.add_argument('--eval_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/eval',
+    parser.add_argument('--eval_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/eval',
                         help='Directory for saving metrics, i.e., FID and LPIPS')
 
     # directory for testing
-    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/results',
+    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/results',
                         help='Directory for saving generated images and videos')
     parser.add_argument('--src_dir', type=str, default='assets/representative/celeba_hq/src',
                         help='Directory containing input source images')
@@ -202,14 +235,14 @@ if __name__ == '__main__':
     #                     help='output directory when aligning faces')
 
     # face alignment
-    parser.add_argument('--wing_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/checkpoints/wing.ckpt')
-    parser.add_argument('--lm_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test/expr/checkpoints/celeba_lm_mean.npz')
+    parser.add_argument('--wing_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/checkpoints/wing.ckpt')
+    parser.add_argument('--lm_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/checkpoints/celeba_lm_mean.npz')
 
     # step size
     parser.add_argument('--print_every', type=int, default=10)
-    parser.add_argument('--sample_every', type=int, default=5000)
-    parser.add_argument('--save_every', type=int, default=10000)
-    parser.add_argument('--eval_every', type=int, default=50000)
+    parser.add_argument('--sample_every', type=int, default=1000)
+    parser.add_argument('--save_every', type=int, default=5000)
+    parser.add_argument('--eval_every', type=int, default=5000)
 
     parser.add_argument('--use_wandb', action='store_true')
 

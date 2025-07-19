@@ -88,8 +88,8 @@ class Solver(nn.Module):
 
         # fetch random validation images for debugging
         fetcher = InputFetcher(loaders.src, loaders.ref, args.latent_dim, 'train')
-        # fetcher_val = InputFetcher(loaders.val, None, args.latent_dim, 'val')
-        # inputs_val = next(fetcher_val)
+        fetcher_val = InputFetcher(loaders.val, None, args.latent_dim, 'val')
+        inputs_val = next(fetcher_val)
 
         # resume training if necessary
         if args.resume_iter > 0:
@@ -147,18 +147,57 @@ class Solver(nn.Module):
                     wandb.log(all_losses, step=i+1)
 
             # # generate images for debugging
-            # if (i+1) % args.sample_every == 0:
-            #     os.makedirs(args.sample_dir, exist_ok=True)
-            #     utils.debug_image(nets_ema, args, inputs=inputs_val, step=i+1)
+            if (i+1) % args.sample_every == 0:
+                step = i+1
+                os.makedirs(args.sample_dir, exist_ok=True)
+                print(f"\n=== Iter {step}: sampling fixed val batch ===")
+
+                x_fixed = inputs_val.x_src    # Shape [B,4,H,W]
+                # 我们按每个目标域都做一次翻译
+                imgs_to_log = []
+                captions   = []
+                with torch.no_grad():
+                    nets_ema.generator.eval()
+                    nets_ema.style_encoder.eval()
+                    for domain in range(min(args.num_domains, 5)):  # 比如只看前5个域
+                        c_t = torch.full((x_fixed.size(0),), domain,
+                                        dtype=torch.long,
+                                        device=x_fixed.device)
+                        # 1) 用 EMA 的 style_encoder 生成风格向量
+                        s_t = nets_ema.style_encoder(x_fixed, c_t)
+                        # 2) 用 EMA 的 generator 做翻译
+                        x_fake = nets_ema.generator(x_fixed, s_t)  # [B,4,H,W]
+                        # 3) 取 batch 中第一个样本，做 RGGB→RGB，映射到 [0,1]
+                        raw = x_fake[0]  # [4,H,W]
+                        r, gr, gb, b = raw[0], raw[1], raw[2], raw[3]
+                        g = 0.5 * (gr + gb)
+                        rgb = torch.stack([r, g, b], dim=0)      # [3,H,W]
+                        rgb = (rgb + 1) * 0.5                   # → [0,1]
+                        arr = (rgb.permute(1,2,0).cpu().numpy() * 255).astype('uint8')
+                        # 4) 转 PIL.Image 并累积
+                        from PIL import Image
+                        pil = Image.fromarray(arr)
+                        imgs_to_log.append(pil)
+                        captions.append(f"iter{step}_dom{domain}")
+
+                # 5) 上传到 WandB
+                if args.use_wandb:
+                    wandb.log({
+                        "val/fixed_samples": [
+                            wandb.Image(img, caption=cap)
+                            for img, cap in zip(imgs_to_log, captions)
+                        ]
+                    }, step=step)
 
             # save model checkpoints
             if (i+1) % args.save_every == 0:
                 self._save_checkpoint(step=i+1)
 
             # # compute FID and LPIPS if necessary
-            # if (i+1) % args.eval_every == 0:
-            #     calculate_metrics(nets_ema, args, i+1, mode='latent')
-            #     calculate_metrics(nets_ema, args, i+1, mode='reference')
+            if (i+1) % args.eval_every == 0:
+                print(f"\n===Iter {i+1}: running test() ===")
+                self.test(step=i+1)
+                print(f"---Done test at iter (i+1) ===\n")
 
     @torch.no_grad()
     def sample(self, loaders):
@@ -193,11 +232,14 @@ class Solver(nn.Module):
         return out.clamp_(0, 1)
 
     @torch.no_grad()
-    def test(self):
+    def test(self, step=None):
         """对成对数据进行正向 (O→T) 和 反向 (T→O) 的 MAE / PSNR / SSIM 评估，并保存三联图。"""
         os.makedirs(self.args.result_dir, exist_ok=True)
         # 1) 恢复 EMA 模型
-        self._load_checkpoint(self.args.resume_iter)
+        if step is None:
+            step = self.args.resume_iter
+
+        self._load_checkpoint(step)
         self.generator_ema.eval()
         self.style_encoder_ema.eval()
 
@@ -225,7 +267,8 @@ class Solver(nn.Module):
         domain2idx = {d:i for i,d in enumerate(domains)}
 
         # 4) 遍历 paired loader
-        for x_o, x_t, filenames, domain_o_list, domain_t_list in tqdm(self.mydata_loader, desc='Testing'):
+        for batch_i, (x_o, x_t, filenames, domain_o_list, domain_t_list) in enumerate(
+                tqdm(self.mydata_loader, desc='Testing')):
             B = x_o.size(0)
             tot_imgs += B
 
@@ -265,33 +308,61 @@ class Solver(nn.Module):
             tot_ssim_r += ssim_r
 
             # 5) 可视化三联图（每批次最多 5 张）
-            V = min(10, B)
-            for k in range(V):
-                trip_f = torch.stack([
-                    rggb2rgb(x_o_den[k]),
-                    rggb2rgb(x_pred_den[k]),
-                    rggb2rgb(x_t_den[k])
-                ], dim=0)
-                save_image(trip_f,
-                           f"{self.args.result_dir}/batch_{k:03d}_fwd.png",
-                           nrow=3)
+            V = min(1, B)
+            if not self.args.use_wandb:
+                for k in range(V):
+                    trip_f = torch.stack([
+                        rggb2rgb(x_o_den[k]),
+                        rggb2rgb(x_pred_den[k]),
+                        rggb2rgb(x_t_den[k])
+                    ], dim=0)
+                    save_image(trip_f,
+                               f"{self.args.result_dir}/batch{batch_i:03d}_idx{k:03d}_fwd.png",
+                               nrow=3)
 
-                trip_r = torch.stack([
-                    rggb2rgb(x_t_den[k]),
-                    rggb2rgb(x_rev_den[k]),
-                    rggb2rgb(x_o_den[k])
-                ], dim=0)
-                save_image(trip_r,
-                           f"{self.args.result_dir}/batch_{k:03d}_rev.png",
-                           nrow=3)
+                    trip_r = torch.stack([
+                        rggb2rgb(x_t_den[k]),
+                        rggb2rgb(x_rev_den[k]),
+                        rggb2rgb(x_o_den[k])
+                    ], dim=0)
+                    save_image(trip_r,
+                               f"{self.args.result_dir}/batch{batch_i:03d}_idx{k:03d}_rev.png",
+                               nrow=3)
 
-        # 6) 打印平均指标
-        print(f'Forward  MAE:{tot_mae_f/tot_imgs:.4f}, '
-              f'PSNR:{tot_psnr_f/tot_imgs:.2f}, '
-              f'SSIM:{tot_ssim_f/tot_imgs:.4f}')
-        print(f'Reverse  MAE:{tot_mae_r/tot_imgs:.4f}, '
-              f'PSNR:{tot_psnr_r/tot_imgs:.2f}, '
-              f'SSIM:{tot_ssim_r/tot_imgs:.4f}')
+        avg_mae_f  = tot_mae_f  / tot_imgs
+        avg_psnr_f = tot_psnr_f / tot_imgs
+        avg_ssim_f = tot_ssim_f / tot_imgs
+        avg_mae_r  = tot_mae_r  / tot_imgs
+        avg_psnr_r = tot_psnr_r / tot_imgs
+        avg_ssim_r = tot_ssim_r / tot_imgs
+
+        avg_mae = (avg_mae_f + avg_mae_r) / 2
+        avg_ssim = (avg_ssim_f + avg_ssim_r) / 2
+        avg_psnr = (avg_psnr_f + avg_psnr_r) / 2
+
+        print(f'Forward  MAE:{avg_mae_f:.4f}, '
+              f'PSNR:{avg_psnr_f:.2f}, '
+              f'SSIM:{avg_ssim_f:.4f}')
+        print(f'Reverse  MAE:{avg_mae_r:.4f}, '
+              f'PSNR:{avg_psnr_r:.2f}, '
+              f'SSIM:{avg_ssim_r:.4f}')
+        print(f'Avg  MAE:{avg_mae:.4f}, '
+              f'PSNR:{avg_psnr:.2f}, '
+              f'SSIM:{avg_ssim:.4f}')
+
+        if self.args.use_wandb:
+            import wandb
+            wandb.log({
+                'Test/MAE_forward':  avg_mae_f,
+                'Test/MAE_reverse': avg_mae_r,
+                'Test/MAE': avg_mae,
+                'Test/SSIM_forward': avg_ssim_f,
+                'Test/SSIM_reverse': avg_ssim_r,
+                'Test/SSIM': avg_ssim,
+                'Test/PSNR_forward': avg_psnr_f,
+                'Test/PSNR_reverse': avg_psnr_r,
+                'Test/PSNR': avg_psnr,
+            }, step=step)
 
 
 def compute_d_loss(nets, args, x_real, y_org, y_trg, z_trg=None, x_ref=None, masks=None):

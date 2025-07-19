@@ -195,6 +195,7 @@ class Solver(nn.Module):
     @torch.no_grad()
     def test(self):
         """对成对数据进行正向 (O→T) 和 反向 (T→O) 的 MAE / PSNR / SSIM 评估，并保存三联图。"""
+        os.makedirs(self.args.result_dir, exist_ok=True)
         # 1) 恢复 EMA 模型
         self._load_checkpoint(self.args.resume_iter)
         self.generator_ema.eval()
@@ -264,7 +265,7 @@ class Solver(nn.Module):
             tot_ssim_r += ssim_r
 
             # 5) 可视化三联图（每批次最多 5 张）
-            V = min(5, B)
+            V = min(10, B)
             for k in range(V):
                 trip_f = torch.stack([
                     rggb2rgb(x_o_den[k]),

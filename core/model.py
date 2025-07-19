@@ -175,16 +175,24 @@ class Generator(nn.Module):
     def forward(self, x, s, masks=None):
         x = self.from_rgb(x)
         cache = {}
+        skips = []
         for block in self.encode:
-            if (masks is not None) and (x.size(2) in [32, 64, 128]):
+            if masks is not None and x.size(2) in [32, 64, 128]:
                 cache[x.size(2)] = x
+            skips.append(x)
             x = block(x)
-        for block in self.decode:
+
+        for idx, block in enumerate(self.decode):
             x = block(x, s)
-            if (masks is not None) and (x.size(2) in [32, 64, 128]):
-                mask = masks[0] if x.size(2) in [32] else masks[1]
-                mask = F.interpolate(mask, size=x.size(2), mode='bilinear')
+            skip = skips[-idx-1]
+            if skip.shape[2:] != x.shape[2:]:
+                skip = F.interpolate(skip, size=x.shape[2:], mode='bilinear', align_corners=False)
+            x = x + skip
+            if masks is not None and x.size(2) in [32, 64, 128]:
+                mask = masks[0] if x.size(2) == 32 else masks[1]
+                mask = F.interpolate(mask, size=x.size(2), mode='bilinear', align_corners=False)
                 x = x + self.hpf(mask * cache[x.size(2)])
+
         return self.to_rgb(x)
 
 

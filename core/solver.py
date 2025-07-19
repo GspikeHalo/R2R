@@ -167,18 +167,18 @@ class Solver(nn.Module):
                         s_t = nets_ema.style_encoder(x_fixed, c_t)
                         # 2) 用 EMA 的 generator 做翻译
                         x_fake = nets_ema.generator(x_fixed, s_t)  # [B,4,H,W]
-                        # 3) 取 batch 中第一个样本，做 RGGB→RGB，映射到 [0,1]
-                        raw = x_fake[0]  # [4,H,W]
-                        r, gr, gb, b = raw[0], raw[1], raw[2], raw[3]
-                        g = 0.5 * (gr + gb)
-                        rgb = torch.stack([r, g, b], dim=0)      # [3,H,W]
-                        rgb = (rgb + 1) * 0.5                   # → [0,1]
-                        arr = (rgb.permute(1,2,0).cpu().numpy() * 255).astype('uint8')
-                        # 4) 转 PIL.Image 并累积
-                        from PIL import Image
-                        pil = Image.fromarray(arr)
-                        imgs_to_log.append(pil)
-                        captions.append(f"iter{step}_dom{domain}")
+                        for idx in range(x_fake.size(0)):
+                            raw = x_fake[idx]  # [4,H,W]
+                            r, gr, gb, b = raw[0], raw[1], raw[2], raw[3]
+                            g = 0.5 * (gr + gb)
+                            rgb = torch.stack([r, g, b], dim=0)  # [3,H,W]
+                            rgb = (rgb + 1) * 0.5  # -> [0,1]
+                            arr = (rgb.permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
+
+                            from PIL import Image
+                            pil = Image.fromarray(arr)
+                            imgs_to_log.append(pil)
+                            captions.append(f"iter{step}_dom{domain}")
 
                 # 5) 上传到 WandB
                 if args.use_wandb:
@@ -311,7 +311,7 @@ class Solver(nn.Module):
 
             # 5) 可视化三联图（每批次最多 5 张）
             V = min(1, B)
-            if self.args.use_wandb:
+            if not self.args.use_wandb:
                 for k in range(V):
                     trip_f = torch.stack([
                         rggb2rgb(x_o_den[k]),

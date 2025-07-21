@@ -18,7 +18,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from core.wing import FAN
-from core.generator import Conformer
 
 
 class ResBlk(nn.Module):
@@ -98,7 +97,7 @@ class AdainResBlk(nn.Module):
 
     def _shortcut(self, x):
         if self.upsample:
-            x = F.interpolate(x, scale_factor=2, mode='nearest')
+            x = F.interpolate(x, scale_factor=2, mode='bicubic')
         if self.learned_sc:
             x = self.conv1x1(x)
         return x
@@ -107,7 +106,7 @@ class AdainResBlk(nn.Module):
         x = self.norm1(x, s)
         x = self.actv(x)
         if self.upsample:
-            x = F.interpolate(x, scale_factor=2, mode='nearest')
+            x = F.interpolate(x, scale_factor=2, mode='bicubic')
         x = self.conv1(x)
         x = self.norm2(x, s)
         x = self.actv(x)
@@ -186,11 +185,11 @@ class Generator(nn.Module):
             x = block(x, s)
             skip = skips[-idx-1]
             if skip.shape[2:] != x.shape[2:]:
-                skip = F.interpolate(skip, size=x.shape[2:], mode='bilinear', align_corners=False)
+                skip = F.interpolate(skip, size=x.shape[2:], mode='bicubic', align_corners=False)
             x = x + skip
             if masks is not None and x.size(2) in [32, 64, 128]:
                 mask = masks[0] if x.size(2) == 32 else masks[1]
-                mask = F.interpolate(mask, size=x.size(2), mode='bilinear', align_corners=False)
+                mask = F.interpolate(mask, size=x.size(2), mode='bicubic', align_corners=False)
                 x = x + self.hpf(mask * cache[x.size(2)])
 
         return self.to_rgb(x)

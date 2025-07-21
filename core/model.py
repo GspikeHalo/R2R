@@ -18,8 +18,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from core.wing import FAN
-from core.generator import Conformer
-
 
 class ResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, actv=nn.LeakyReLU(0.2),
@@ -65,18 +63,6 @@ class ResBlk(nn.Module):
         return x / math.sqrt(2)  # unit variance
 
 
-class AdaIN(nn.Module):
-    def __init__(self, style_dim, num_features):
-        super().__init__()
-        self.norm = nn.InstanceNorm2d(num_features, affine=False)
-        self.fc = nn.Linear(style_dim, num_features*2)
-
-    def forward(self, x, s):
-        h = self.fc(s)
-        h = h.view(h.size(0), h.size(1), 1, 1)
-        gamma, beta = torch.chunk(h, chunks=2, dim=1)
-        return (1 + gamma) * self.norm(x) + beta
-
 class ModulatedConv2d(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size, style_dim, demodulate=True, eps=1e-8):
         super().__init__()
@@ -85,6 +71,8 @@ class ModulatedConv2d(nn.Module):
         self.weight = nn.Parameter(torch.randn(1, out_ch, in_ch, kernel_size, kernel_size))
         self.style_fc = nn.Linear(style_dim, in_ch)
         self.padding = kernel_size // 2
+        self.bias = nn.Parameter(torch.zeros(out_ch))
+        self.scale = 1 / math.sqrt(in_ch * kernel_size * kernel_size)
 
     def forward(self, x, s):
         # x: [B, in_ch, H, W], s: [B, style_dim]
@@ -94,23 +82,24 @@ class ModulatedConv2d(nn.Module):
         if self.demodulate:
             d = torch.rsqrt((w**2).sum([2,3,4]) + self.eps)  # [B, out_ch]
             w = w * d.view(B, -1, 1, 1, 1)
+        w = w * self.scale
         x = x.view(1, -1, H, W)
-        w = w.view(B * w.shape[1], w.shape[2], w.shape[3], w.shape[4])
+        w = w.view(B * w.size(1), w.size(2), w.size(3), w.size(4))
         out = F.conv2d(x, w, padding=self.padding, groups=B)
         out = out.view(B, -1, H, W)
-        return out
+        return out + self.bias.view(1, -1, 1, 1)
+
 
 class ModulatedResBlk(nn.Module):
-    def __init__(self, dim_in, dim_out, style_dim=64, w_hpf=0,
+    def __init__(self, dim_in, dim_out, style_dim=64,
                  actv=nn.LeakyReLU(0.2), upsample=False):
         super().__init__()
-        self.w_hpf = w_hpf
         self.actv = actv
         self.upsample = upsample
         self.learned_sc = dim_in != dim_out
-        self._build_weights(dim_in, dim_out, style_dim)
 
-    def _build_weights(self, dim_in, dim_out, style_dim):
+        self.norm1 = nn.InstanceNorm2d(dim_in, affine=False)
+        self.norm2 = nn.InstanceNorm2d(dim_out, affine=False)
         self.conv1 = ModulatedConv2d(dim_in, dim_out, 3, style_dim, demodulate=True)
         self.conv2 = ModulatedConv2d(dim_out, dim_out, 3, style_dim, demodulate=True)
         if self.learned_sc:
@@ -124,19 +113,20 @@ class ModulatedResBlk(nn.Module):
         return x
 
     def _residual(self, x, s):
-        x = self.actv(x)
+        x = self.norm1(x)
         if self.upsample:
             x = F.interpolate(x, scale_factor=2, mode='nearest')
         x = self.conv1(x, s)
         x = self.actv(x)
+        x = self.norm2(x)
         x = self.conv2(x, s)
+        x = self.actv(x)
         return x
 
     def forward(self, x, s):
-        out = self._residual(x, s)
-        if self.w_hpf == 0:
-            out = (out + self._shortcut(x)) / math.sqrt(2)
-        return out
+        res  = self._residual(x, s)
+        skip = self._shortcut(x)
+        return (res + skip) / math.sqrt(2)
 
 
 class HighPass(nn.Module):
@@ -174,8 +164,7 @@ class Generator(nn.Module):
             self.encode.append(
                 ResBlk(dim_in, dim_out, normalize=True, downsample=True))
             self.decode.insert(
-                0, ModulatedResBlk(dim_out, dim_in, style_dim,
-                               w_hpf=w_hpf, upsample=True))  # stack-like
+                0, ModulatedResBlk(dim_out, dim_in, style_dim, upsample=True))  # stack-like
             dim_in = dim_out
 
         # bottleneck blocks
@@ -183,7 +172,7 @@ class Generator(nn.Module):
             self.encode.append(
                 ResBlk(dim_out, dim_out, normalize=True))
             self.decode.insert(
-                0, ModulatedResBlk(dim_out, dim_out, style_dim, w_hpf=w_hpf))
+                0, ModulatedResBlk(dim_out, dim_out, style_dim))
 
         if w_hpf > 0:
             device = torch.device(
@@ -219,20 +208,20 @@ class MappingNetwork(nn.Module):
         super().__init__()
         layers = []
         layers += [nn.Linear(latent_dim, 512)]
-        layers += [nn.ReLU()]
+        layers += [nn.LeakyReLU()]
         for _ in range(3):
             layers += [nn.Linear(512, 512)]
-            layers += [nn.ReLU()]
+            layers += [nn.LeakyReLU()]
         self.shared = nn.Sequential(*layers)
 
         self.unshared = nn.ModuleList()
         for _ in range(num_domains):
             self.unshared += [nn.Sequential(nn.Linear(512, 512),
-                                            nn.ReLU(),
+                                            nn.LeakyReLU(),
                                             nn.Linear(512, 512),
-                                            nn.ReLU(),
+                                            nn.LeakyReLU(),
                                             nn.Linear(512, 512),
-                                            nn.ReLU(),
+                                            nn.LeakyReLU(),
                                             nn.Linear(512, style_dim))]
 
     def forward(self, z, y):

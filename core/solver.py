@@ -195,8 +195,6 @@ class Solver(nn.Module):
 
             # # compute FID and LPIPS if necessary
             if (i+1) % args.eval_every == 0:
-                # calculate_metrics(nets_ema, args, i+1, mode='latent')
-                # calculate_metrics(nets_ema, args, i+1, mode='reference')
                 print(f"\n===Iter {i+1}: running test() ===")
                 self.test(step=i+1)
                 print(f"---Done test at iter (i+1) ===\n")
@@ -236,6 +234,7 @@ class Solver(nn.Module):
     @torch.no_grad()
     def test(self, step=None):
         """对成对数据进行正向 (O→T) 和 反向 (T→O) 的 MAE / PSNR / SSIM 评估，并保存三联图。"""
+        os.makedirs(self.args.result_dir, exist_ok=True)
         # 1) 恢复 EMA 模型
         if step is None:
             step = self.args.resume_iter
@@ -266,7 +265,6 @@ class Solver(nn.Module):
         # 3) 构建 domain→idx 映射（与 PairedNpyDataset 使用的子目录一致）
         domains = sorted(os.listdir(self.args.val_img_dir))
         domain2idx = {d:i for i,d in enumerate(domains)}
-        os.makedirs(self.args.result_dir, exist_ok=True)
 
         # 4) 遍历 paired loader
         for batch_i, (x_o, x_t, filenames, domain_o_list, domain_t_list) in enumerate(
@@ -286,8 +284,8 @@ class Solver(nn.Module):
             # —— Forward: O→T ——
             s_t        = self.style_encoder_ema(x_t, y_t)
             x_pred     = self.generator_ema(x_o, s_t)
-            x_pred_den = x_pred
-            x_t_den    = x_t
+            x_pred_den = self.denorm(x_pred)
+            x_t_den    = self.denorm(x_t)
 
             mae_f  = torch.abs(x_pred_den - x_t_den).view(B, -1).mean(dim=1).sum().item()
             psnr_f = _psnr(x_pred_den, x_t_den).sum().item()
@@ -299,8 +297,8 @@ class Solver(nn.Module):
             # —— Reverse: T→O ——
             s_o     = self.style_encoder_ema(x_o, y_o)
             x_rev   = self.generator_ema(x_t, s_o)
-            x_rev_den = x_rev
-            x_o_den   = x_o
+            x_rev_den = self.denorm(x_rev)
+            x_o_den   = self.denorm(x_o)
 
             mae_r  = torch.abs(x_rev_den - x_o_den).view(B, -1).mean(dim=1).sum().item()
             psnr_r = _psnr(x_rev_den, x_o_den).sum().item()

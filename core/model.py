@@ -18,7 +18,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from core.wing import FAN
-from core.generator import Conformer
 
 
 class ResBlk(nn.Module):
@@ -201,20 +200,20 @@ class MappingNetwork(nn.Module):
         super().__init__()
         layers = []
         layers += [nn.Linear(latent_dim, 512)]
-        layers += [nn.ReLU()]
+        layers += [nn.LeakyReLU()]
         for _ in range(3):
             layers += [nn.Linear(512, 512)]
-            layers += [nn.ReLU()]
+            layers += [nn.LeakyReLU()]
         self.shared = nn.Sequential(*layers)
 
         self.unshared = nn.ModuleList()
         for _ in range(num_domains):
             self.unshared += [nn.Sequential(nn.Linear(512, 512),
-                                            nn.ReLU(),
+                                            nn.LeakyReLU(),
                                             nn.Linear(512, 512),
-                                            nn.ReLU(),
+                                            nn.LeakyReLU(),
                                             nn.Linear(512, 512),
-                                            nn.ReLU(),
+                                            nn.LeakyReLU(),
                                             nn.Linear(512, style_dim))]
 
     def forward(self, z, y):

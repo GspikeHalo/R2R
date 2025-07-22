@@ -84,39 +84,48 @@ class AdainResBlk(nn.Module):
         self.w_hpf = w_hpf
         self.actv = actv
         self.upsample = upsample
+        orig_dim_in = dim_in
+        if self.upsample:
+            dim_in = dim_in * 2
         self.learned_sc = dim_in != dim_out
-        self._build_weights(dim_in, dim_out, style_dim)
+        self._build_weights(dim_in, dim_out, style_dim, orig_dim_in)
 
-    def _build_weights(self, dim_in, dim_out, style_dim=64):
-        self.conv1 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
+    def _build_weights(self, dim_in, dim_out, style_dim, orig_dim_in):
+        if self.upsample:
+            self.conv1 = nn.Conv2d(dim_in, dim_out*4, 3, 1, 1)
+            self.pixel_shuffle = nn.PixelShuffle(2)
+        else:
+            self.conv1 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
         self.conv2 = nn.Conv2d(dim_out, dim_out, 3, 1, 1)
         self.norm1 = AdaIN(style_dim, dim_in)
         self.norm2 = AdaIN(style_dim, dim_out)
-        if self.learned_sc:
-            self.conv1x1 = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=False)
 
-    def _shortcut(self, x):
         if self.upsample:
-            x = F.interpolate(x, scale_factor=2, mode='bicubic')
-        if self.learned_sc:
-            x = self.conv1x1(x)
-        return x
-
-    def _residual(self, x, s):
-        x = self.norm1(x, s)
-        x = self.actv(x)
-        if self.upsample:
-            x = F.interpolate(x, scale_factor=2, mode='bicubic')
-        x = self.conv1(x)
-        x = self.norm2(x, s)
-        x = self.actv(x)
-        x = self.conv2(x)
-        return x
+            self.conv1x1 = nn.Conv2d(orig_dim_in, dim_out*4, 1, bias=False)
+        elif self.learned_sc:
+            self.conv1x1 = nn.Conv2d(dim_in,      dim_out,   1, bias=False)
 
     def forward(self, x, s):
-        out = self._residual(x, s)
-        if self.w_hpf == 0:
-            out = (out + self._shortcut(x)) / math.sqrt(2)
+        h = self.norm1(x, s)
+        h = self.actv(h)
+
+        h = self.conv1(h)  # (B, dim_out*4, H, W) if upsample else (B, dim_out, H, W)
+        if self.upsample:
+            h = self.pixel_shuffle(h)  # →(B, dim_out, H*2, W*2)
+
+        h = self.norm2(h, s)
+        h = self.actv(h)
+        h = self.conv2(h)  # (B, dim_out, H*2, W*2) 或 (B, dim_out, H, W)
+
+        if self.upsample:
+            sc = self.conv1x1(x)  # (B, dim_out*4, H, W)
+            sc = self.pixel_shuffle(sc)  # →(B, dim_out, H*2, W*2)
+        elif self.learned_sc:
+            sc = self.conv1x1(x)  # (B, dim_out, H, W)
+        else:
+            sc = x  # identity
+
+        out = (h + sc) / math.sqrt(2)
         return out
 
 
@@ -146,6 +155,7 @@ class Generator(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Conv2d(dim_in, 4, 1, 1, 0))
 
+        self.skip_adjusts = nn.ModuleList()
         # down/up-sampling blocks
         repeat_num = int(np.log2(img_size)) - 4
         if w_hpf > 0:
@@ -157,6 +167,9 @@ class Generator(nn.Module):
             self.decode.insert(
                 0, AdainResBlk(dim_out, dim_in, style_dim,
                                w_hpf=w_hpf, upsample=True))  # stack-like
+            self.skip_adjusts.insert(
+                0, nn.Conv2d(dim_out, dim_in, kernel_size=1, bias=False)
+            )
             dim_in = dim_out
 
         # bottleneck blocks
@@ -165,6 +178,9 @@ class Generator(nn.Module):
                 ResBlk(dim_out, dim_out, normalize=True))
             self.decode.insert(
                 0, AdainResBlk(dim_out, dim_out, style_dim, w_hpf=w_hpf))
+            self.skip_adjusts.insert(
+                0, nn.Conv2d(dim_out, dim_out, kernel_size=1, bias=False)
+            )
 
         if w_hpf > 0:
             device = torch.device(
@@ -182,15 +198,17 @@ class Generator(nn.Module):
             x = block(x)
 
         for idx, block in enumerate(self.decode):
-            x = block(x, s)
             skip = skips[-idx-1]
             if skip.shape[2:] != x.shape[2:]:
                 skip = F.interpolate(skip, size=x.shape[2:], mode='bicubic', align_corners=False)
-            x = x + skip
-            if masks is not None and x.size(2) in [32, 64, 128]:
-                mask = masks[0] if x.size(2) == 32 else masks[1]
-                mask = F.interpolate(mask, size=x.size(2), mode='bicubic', align_corners=False)
-                x = x + self.hpf(mask * cache[x.size(2)])
+            skip = self.skip_adjusts[idx](skip)
+            x = torch.cat([x, skip], dim=1)
+            x = block(x, s)
+
+            # if masks is not None and x.size(2) in [32, 64, 128]:
+            #     mask = masks[0] if x.size(2) == 32 else masks[1]
+            #     mask = F.interpolate(mask, size=x.size(2), mode='bicubic', align_corners=False)
+            #     x = x + self.hpf(mask * cache[x.size(2)])
 
         return self.to_rgb(x)
 
@@ -200,20 +218,20 @@ class MappingNetwork(nn.Module):
         super().__init__()
         layers = []
         layers += [nn.Linear(latent_dim, 512)]
-        layers += [nn.ReLU()]
+        layers += [nn.LeakyReLU()]
         for _ in range(3):
             layers += [nn.Linear(512, 512)]
-            layers += [nn.ReLU()]
+            layers += [nn.LeakyReLU()]
         self.shared = nn.Sequential(*layers)
 
         self.unshared = nn.ModuleList()
         for _ in range(num_domains):
             self.unshared += [nn.Sequential(nn.Linear(512, 512),
-                                            nn.ReLU(),
+                                            nn.LeakyReLU(),
                                             nn.Linear(512, 512),
-                                            nn.ReLU(),
+                                            nn.LeakyReLU(),
                                             nn.Linear(512, 512),
-                                            nn.ReLU(),
+                                            nn.LeakyReLU(),
                                             nn.Linear(512, style_dim))]
 
     def forward(self, z, y):

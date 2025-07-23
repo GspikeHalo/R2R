@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from core.transformer import ExtendedPixelwiseViT
 from core.wing import FAN
 
 
@@ -165,6 +166,20 @@ class Generator(nn.Module):
                 ResBlk(dim_out, dim_out, normalize=True))
             self.decode.insert(
                 0, AdainResBlk(dim_out, dim_out, style_dim, w_hpf=w_hpf))
+        bottleneck_channels = dim_out
+        bottleneck_spatial = img_size // (2 ** repeat_num) # should be [512, 16, 16]
+
+        self.pixelvit = ExtendedPixelwiseViT(
+            style_dim=style_dim,
+            features=bottleneck_channels,
+            n_heads=4,
+            n_blocks=2,
+            ffn_features=bottleneck_channels * 2,
+            embed_features=64,
+            image_shape=(bottleneck_channels, bottleneck_spatial, bottleneck_spatial),
+            rezero=True,
+            n_ext=1
+        )
 
         if w_hpf > 0:
             device = torch.device(
@@ -180,6 +195,8 @@ class Generator(nn.Module):
                 cache[x.size(2)] = x
             skips.append(x)
             x = block(x)
+
+        x, s = self.pixelvit(x, s)
 
         for idx, block in enumerate(self.decode):
             x = block(x, s)

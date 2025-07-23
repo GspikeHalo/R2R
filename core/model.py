@@ -84,6 +84,7 @@ class AdainResBlk(nn.Module):
         self.w_hpf = w_hpf
         self.actv = actv
         self.upsample = upsample
+        self.up_scale = 2
         self.learned_sc = dim_in != dim_out
         self._build_weights(dim_in, dim_out, skip_in, style_dim)
 
@@ -92,21 +93,31 @@ class AdainResBlk(nn.Module):
         self.conv2 = nn.Conv2d(dim_out, dim_out, 3, 1, 1)
         self.norm1 = AdaIN(style_dim, dim_in)
         self.norm2 = AdaIN(style_dim, dim_out)
+        self.conv1x1_up = nn.Conv2d(dim_in, dim_out * (self.up_scale ** 2), 1, 1, 0, bias=False)
         if self.learned_sc:
             self.conv1x1 = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=False)
 
+        if self.upsample:
+            self.conv_up = nn.Conv2d(dim_in, dim_in*(self.up_scale**2), 3, 1, 1)
+            self.pixel_shuffle = nn.PixelShuffle(self.up_scale)
+
     def _shortcut(self, x):
         if self.upsample:
-            x = F.interpolate(x, scale_factor=2, mode='bicubic')
-        if self.learned_sc:
-            x = self.conv1x1(x)
-        return x
+            sc = self.conv1x1_up(x)
+            sc = self.pixel_shuffle(sc)
+        elif self.learned_sc:
+            sc = self.conv1x1(x)
+        else:
+            sc = x
+        return sc
 
     def _residual(self, x, s, skip):
         x = self.norm1(x, s)
         x = self.actv(x)
         if self.upsample:
-            x = F.interpolate(x, scale_factor=2, mode='bicubic')
+            x = self.conv_up(x)
+            x = self.pixel_shuffle(x)
+
         if skip is not None:
             x = torch.cat([x, skip], dim=1)
         x = self.conv1(x)
@@ -115,12 +126,13 @@ class AdainResBlk(nn.Module):
         x = self.conv2(x)
         return x
 
-    def forward(self, x, s, skip):
+    def forward(self, x, s, skip=None):
         out = self._residual(x, s, skip)
         if self.w_hpf == 0:
-            out = (out + self._shortcut(x)) / math.sqrt(2)
-        return out
-
+            sc = self._shortcut(x)
+            return (out + sc) / math.sqrt(2)
+        else:
+            return out
 
 class HighPass(nn.Module):
     def __init__(self, w_hpf, device):

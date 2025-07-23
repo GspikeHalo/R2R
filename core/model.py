@@ -78,7 +78,7 @@ class AdaIN(nn.Module):
 
 
 class AdainResBlk(nn.Module):
-    def __init__(self, dim_in, dim_out, skip_in, style_dim=64, w_hpf=0,
+    def __init__(self, dim_in, dim_out, style_dim=64, w_hpf=0,
                  actv=nn.LeakyReLU(0.2), upsample=False):
         super().__init__()
         self.w_hpf = w_hpf
@@ -86,10 +86,10 @@ class AdainResBlk(nn.Module):
         self.upsample = upsample
         self.up_scale = 2
         self.learned_sc = dim_in != dim_out
-        self._build_weights(dim_in, dim_out, skip_in, style_dim)
+        self._build_weights(dim_in, dim_out, style_dim)
 
-    def _build_weights(self, dim_in, dim_out, skip_in, style_dim=64):
-        self.conv1 = nn.Conv2d(dim_in + skip_in, dim_out, 3, 1, 1)
+    def _build_weights(self, dim_in, dim_out, style_dim=64):
+        self.conv1 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
         self.conv2 = nn.Conv2d(dim_out, dim_out, 3, 1, 1)
         self.norm1 = AdaIN(style_dim, dim_in)
         self.norm2 = AdaIN(style_dim, dim_out)
@@ -111,23 +111,21 @@ class AdainResBlk(nn.Module):
             sc = x
         return sc
 
-    def _residual(self, x, s, skip):
+    def _residual(self, x, s):
         x = self.norm1(x, s)
         x = self.actv(x)
         if self.upsample:
             x = self.conv_up(x)
             x = self.pixel_shuffle(x)
 
-        if skip is not None:
-            x = torch.cat([x, skip], dim=1)
         x = self.conv1(x)
         x = self.norm2(x, s)
         x = self.actv(x)
         x = self.conv2(x)
         return x
 
-    def forward(self, x, s, skip=None):
-        out = self._residual(x, s, skip)
+    def forward(self, x, s):
+        out = self._residual(x, s)
         if self.w_hpf == 0:
             sc = self._shortcut(x)
             return (out + sc) / math.sqrt(2)
@@ -169,7 +167,7 @@ class Generator(nn.Module):
             self.encode.append(
                 ResBlk(dim_in, dim_out, normalize=True, downsample=True))
             self.decode.insert(
-                0, AdainResBlk(dim_out, dim_in, dim_in, style_dim,
+                0, AdainResBlk(dim_out, dim_in, style_dim,
                                w_hpf=w_hpf, upsample=True))  # stack-like
             dim_in = dim_out
 
@@ -178,7 +176,7 @@ class Generator(nn.Module):
             self.encode.append(
                 ResBlk(dim_out, dim_out, normalize=True))
             self.decode.insert(
-                0, AdainResBlk(dim_out, dim_out, 0, style_dim, w_hpf=w_hpf))
+                0, AdainResBlk(dim_out, dim_out, style_dim, w_hpf=w_hpf))
 
         if w_hpf > 0:
             device = torch.device(
@@ -196,15 +194,9 @@ class Generator(nn.Module):
             x = block(x)
 
         for idx, block in enumerate(self.decode):
-            if idx != 0 and idx != 1:
-                skip = skips[-idx-1]
-            else:
-                skip = None
-            x = block(x, s, skip)
-            # if masks is not None and x.size(2) in [32, 64, 128]:
-            #     mask = masks[0] if x.size(2) == 32 else masks[1]
-            #     mask = F.interpolate(mask, size=x.size(2), mode='bicubic', align_corners=False)
-            #     x = x + self.hpf(mask * cache[x.size(2)])
+            x = block(x, s)
+            skip = skips[-idx-1]
+            x = x + skip
 
         return self.to_rgb(x)
 

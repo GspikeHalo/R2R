@@ -174,56 +174,46 @@ class ExtendedPixelwiseViT(nn.Module):
         self, style_dim=64, features=256, n_heads=4, n_blocks=3, ffn_features=256, embed_features=64, image_shape=(512, 16, 16), rezero = True, n_ext = 1, **kwargs
     ):
         super().__init__(**kwargs)
+        self.style_dim   = style_dim
+        self.features    = features
+        self.n_ext       = n_ext
+        self.image_shape = image_shape
 
-        self.style_dim  = style_dim
-        self.features   = features
-        self.n_ext      = n_ext
-        self.image_shape= image_shape
-
+        # style → extra tokens
         self.style2tokens = nn.Linear(style_dim, n_ext * features)
-        self.trans_input = ViTInput(
-            image_shape[0], embed_features, features,
-            image_shape[1], image_shape[2],
+        # pixel embedding
+        self.trans_input  = ViTInput(
+            input_features=image_shape[0],
+            embed_features=embed_features,
+            features=features,
+            height=image_shape[1],
+            width=image_shape[2]
         )
 
-        self.encoder = TransformerEncoder(
-            features, ffn_features, n_heads, n_blocks, rezero
-        )
+        self.cross_atts  = nn.ModuleList([
+            nn.MultiheadAttention(embed_dim=features, num_heads=n_heads)
+            for _ in range(n_blocks)
+        ])
+        self.cross_ffns  = nn.ModuleList([
+            PositionWiseFFN(features, ffn_features)
+            for _ in range(n_blocks)
+        ])
 
         self.tokens2style = nn.Linear(n_ext * features, style_dim)
-        self.trans_output = nn.Linear(features, image_shape[0])
 
     def forward(self, x, s):
-        # x : (N, C, H, W)
         N, C, H, W = x.shape
-        assert s.dim() == 2 and s.size(1) == self.style_dim
+        y      = self.trans_input(img_to_pixelwise_tokens(x))  # (N, L, features)
+        y_seq  = y.permute(1, 0, 2)                             # (L, N, features)
 
-        # itokens : (N, L, C)
-        itokens    = img_to_pixelwise_tokens(x)
-        (N, L, _C) = itokens.shape
+        s_seq  = self.style2tokens(s)                           # (N, n_ext*feat)
+        s_seq  = s_seq.view(N, self.n_ext, self.features)      # (N, n_ext, feat)
+        s_seq  = s_seq.permute(1, 0, 2)                         # (n_ext, N, feat)
 
-        s_tokens = self.style2tokens(s)                                # (N, n_ext*features)
-        s_tokens = s_tokens.view(N, self.n_ext, self.features)
+        for attn, ffn in zip(self.cross_atts, self.cross_ffns):
+            cross, _ = attn(query=s_seq, key=y_seq, value=y_seq)  # (n_ext, N, feat)
+            s_seq     = ffn(cross)                                # (n_ext, N, feat)
 
-        # i_extra_tokens : (N, n_extra, C)
-        # i_extra_tokens = self.extra_tokens.tile(itokens.shape[0], 1, 1)
-
-        # y : (N, L, features)
-        y = self.trans_input(itokens)
-
-        # y : (N, L + n_extra, C)
-        y = torch.cat([ y, s_tokens ], dim = 1)
-        y = self.encoder(y)
-
-        # o_extra_tokens : (N, n_extra, features)
-        o_extra_tokens = y[:, L:, :]
-
-        # otokens : (N, L, C)
-        otokens = self.trans_output(y[:, :L, :])
-
-        # result : (N, C, H, W)
-        result = img_from_pixelwise_tokens(otokens, self.image_shape)
-        extra_flat = o_extra_tokens.reshape(N, -1)                       # (N, n_ext*features)
-        style_out  = self.tokens2style(extra_flat)
-
-        return result, style_out
+        o_extra   = s_seq.permute(1, 0, 2).reshape(N, -1)        # (N, n_ext*feat)
+        style_out = self.tokens2style(o_extra)                  # (N, style_dim)
+        return style_out

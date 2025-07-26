@@ -171,7 +171,7 @@ class Generator(nn.Module):
 
         self.pixelvit = ExtendedPixelwiseViT(
             style_dim=style_dim,
-            features=bottleneck_channels,
+            features=256,
             n_heads=4,
             n_blocks=2,
             ffn_features=bottleneck_channels * 2,

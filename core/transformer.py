@@ -171,7 +171,7 @@ class TransformerEncoder(nn.Module):
 class ExtendedPixelwiseViT(nn.Module):
 
     def __init__(
-        self, style_dim=64, features=256, n_heads=4, n_blocks=6, ffn_features=512, embed_features=64, image_shape=(512, 16, 16), rezero = True, n_ext = 1, **kwargs
+        self, style_dim=64, features=256, n_heads=4, n_blocks=3, ffn_features=256, embed_features=64, image_shape=(512, 16, 16), rezero = True, n_ext = 1, **kwargs
     ):
         super().__init__(**kwargs)
 

@@ -186,7 +186,7 @@ class Generator(nn.Module):
                 'cuda' if torch.cuda.is_available() else 'cpu')
             self.hpf = HighPass(w_hpf, device)
 
-    def forward(self, x, s, masks=None):
+    def forward(self, x, s, s_aux, masks=None):
         x = self.from_rgb(x)
         cache = {}
         skips = []
@@ -196,7 +196,7 @@ class Generator(nn.Module):
             skips.append(x)
             x = block(x)
 
-        x, s = self.pixelvit(x, s)
+        x = self.pixelvit(x, s_aux)
 
         for idx, block in enumerate(self.decode):
             x = block(x, s)
@@ -262,20 +262,23 @@ class StyleEncoder(nn.Module):
         blocks += [nn.LeakyReLU(0.2)]
         self.shared = nn.Sequential(*blocks)
 
-        self.unshared = nn.ModuleList()
-        for _ in range(num_domains):
-            self.unshared += [nn.Linear(dim_out, style_dim)]
+        self.unshared = nn.ModuleList(
+            [nn.Linear(dim_out, style_dim) for _ in range(num_domains)]
+        )
+        self.unshared_aux  = nn.ModuleList(
+            [nn.Linear(dim_out, style_dim) for _ in range(num_domains)]
+        )
 
     def forward(self, x, y):
         h = self.shared(x)
         h = h.view(h.size(0), -1)
-        out = []
-        for layer in self.unshared:
-            out += [layer(h)]
-        out = torch.stack(out, dim=1)  # (batch, num_domains, style_dim)
+        out = torch.stack([layer(h) for layer in self.unshared], dim=1)
+        out_aux  = torch.stack([layer(h) for layer in self.unshared_aux], dim=1)
         idx = torch.LongTensor(range(y.size(0))).to(y.device)
         s = out[idx, y]  # (batch, style_dim)
-        return s
+        s_aux  = out_aux[idx,  y]
+
+        return s, s_aux
 
 
 class Discriminator(nn.Module):

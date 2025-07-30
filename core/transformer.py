@@ -190,7 +190,6 @@ class ExtendedPixelwiseViT(nn.Module):
             features, ffn_features, n_heads, n_blocks, rezero
         )
 
-        self.tokens2style = nn.Linear(n_ext * features, style_dim)
         self.trans_output = nn.Linear(features, image_shape[0])
 
     def forward(self, x, s):
@@ -223,7 +222,5 @@ class ExtendedPixelwiseViT(nn.Module):
 
         # result : (N, C, H, W)
         result = img_from_pixelwise_tokens(otokens, self.image_shape)
-        extra_flat = o_extra_tokens.reshape(N, -1)                       # (N, n_ext*features)
-        style_out  = self.tokens2style(extra_flat)
 
-        return result, style_out
+        return result

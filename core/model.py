@@ -331,5 +331,4 @@ def build_model(args):
         fan.get_heatmap = fan.module.get_heatmap
         nets.fan = fan
         nets_ema.fan = fan
-
     return nets, nets_ema

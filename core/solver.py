@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_msssim import SSIM
 
-from core.model import build_model
+from core.model import build_model, NoiseHistogramLoss
 from core.checkpoint import CheckpointIO
 from core.data_loader import InputFetcher
 import core.utils as utils
@@ -32,9 +32,19 @@ import wandb
 class Solver(nn.Module):
     def __init__(self, args):
         super().__init__()
+        noise_profile_paths = {
+            "cameraA":  "./preprocess/noise_profiles/iphone_profile.pt",
+            "cameraB": "./preprocess/noise_profiles/samsung_profile.pt",
+        }
+
         self.args = args
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.noise_loss_fns = {
+            domain: NoiseHistogramLoss(path, device=self.device)
+            for domain, path in noise_profile_paths.items()
+        }
 
+        self.domains = list(noise_profile_paths.keys())
         self.nets, self.nets_ema = build_model(args)
         # below setattrs are to make networks be children of Solver, e.g., for self.to(self.device)
         for name, module in self.nets.items():
@@ -114,8 +124,24 @@ class Solver(nn.Module):
             d_loss.backward()
             optims.discriminator.step()
 
+            # g_loss, g_losses_ref = compute_g_loss(
+            #     nets, args, x_real, y_org, y_trg, x_refs=[x_ref, x_ref2], masks=masks)
+
+            domain_idx = y_trg[0].item()
+            domain_str = self.domains[domain_idx]
+            noise_fn = self.noise_loss_fns[domain_str]
+            lambda_noise = args.lambda_noise
             g_loss, g_losses_ref = compute_g_loss(
-                nets, args, x_real, y_org, y_trg, x_refs=[x_ref, x_ref2], masks=masks)
+                nets,
+                args,
+                x_real, y_org,y_trg,
+                x_refs=[x_ref, x_ref2],
+                masks=masks,
+                noise_loss_fn=noise_fn,
+                lambda_noise=lambda_noise
+            )
+
+
             self._reset_grad()
             g_loss.backward()
             optims.generator.step()
@@ -391,7 +417,7 @@ def compute_d_loss(nets, args, x_real, y_org, y_trg, z_trg=None, x_ref=None, mas
                        fake=loss_fake.item(),
                        reg=loss_reg.item())
 
-def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, masks=None):
+def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, masks=None, noise_loss_fn=None, lambda_noise=0):
     assert (z_trgs is None) != (x_refs is None)
     if z_trgs is not None:
         z_trg, z_trg2 = z_trgs
@@ -407,6 +433,11 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, m
     x_fake = nets.generator(x_real, s_trg, masks=masks)
     out = nets.discriminator(x_fake, y_trg)
     loss_adv = adv_loss(out, 1)
+
+    if noise_loss_fn is not None and lambda_noise > 0:
+        loss_noise = noise_loss_fn(x_fake)
+    else:
+        loss_noise = x_fake.new_tensor(0.0)
 
     # style reconstruction loss
     s_pred = nets.style_encoder(x_fake, y_trg)
@@ -428,11 +459,12 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, m
     loss_cyc = torch.mean(torch.abs(x_rec - x_real))
 
     loss = loss_adv + args.lambda_sty * loss_sty \
-        - args.lambda_ds * loss_ds + args.lambda_cyc * loss_cyc
+        - args.lambda_ds * loss_ds + args.lambda_cyc * loss_cyc + lambda_noise * loss_noise
     return loss, Munch(adv=loss_adv.item(),
                        sty=loss_sty.item(),
                        ds=loss_ds.item(),
-                       cyc=loss_cyc.item())
+                       cyc=loss_cyc.item(),
+                       noise = loss_noise.item())
 
 
 def moving_average(model, model_test, beta=0.999):

@@ -20,6 +20,53 @@ import torch.nn.functional as F
 from core.wing import FAN
 
 
+class NoiseHistogramLoss(nn.Module):
+    def __init__(self, profile_path, patch_size=16, num_bins=100, device='cuda'):
+        super().__init__()
+        self.patch_size = patch_size
+        self.num_bins = num_bins
+        self.register_buffer('target_histogram', torch.load(profile_path).to(device))
+        self.register_buffer('bins', torch.linspace(0.0, 1.0, self.num_bins + 1).to(device))
+
+    def forward(self, generated_image):
+        B, C, H, W = generated_image.shape
+        patches = generated_image.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size,
+                                                                                     self.patch_size)
+        patches = patches.contiguous().view(B, C, -1, self.patch_size * self.patch_size)
+        patches = patches.permute(0, 2, 1, 3).contiguous().view(B, -1, C * self.patch_size * self.patch_size)
+        means = patches.mean(dim=-1)
+        variances = patches.var(dim=-1)
+
+        batch_histograms = torch.zeros(B, self.num_bins, device=generated_image.device)
+        batch_counts = torch.zeros(B, self.num_bins, device=generated_image.device)
+        bin_indices = torch.bucketize(means.detach(), self.bins, right=True) - 1
+
+        for i in range(B):
+            valid_mask = (bin_indices[i] >= 0) & (bin_indices[i] < self.num_bins)
+            valid_indices = bin_indices[i][valid_mask]
+            valid_variances = variances[i][valid_mask]
+            sum_vars = torch.zeros(self.num_bins, device=generated_image.device).scatter_add_(0, valid_indices,
+                                                                                              valid_variances)
+            counts = torch.zeros(self.num_bins, device=generated_image.device).scatter_add_(0, valid_indices,
+                                                                                            torch.ones_like(
+                                                                                                valid_variances))
+            batch_histograms[i] = sum_vars / (counts + 1e-8)
+            batch_counts[i] = counts
+
+        mask = (batch_counts > 0).float()
+        diff = torch.abs(batch_histograms - self.target_histogram.unsqueeze(0))
+        loss = (diff * mask).sum()
+
+        per_sample_counts = mask.sum(dim=1).clamp(min=1.0)
+        loss = (loss / per_sample_counts).mean()
+        return loss
+        # non_zero_mask = (batch_histograms > 0).float()
+        # loss = F.l1_loss(batch_histograms * non_zero_mask,
+        #                  self.target_histogram.unsqueeze(0) * non_zero_mask,
+        #                  reduction='sum')
+        # loss = loss / non_zero_mask.sum()
+        # return loss
+
 class ResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, actv=nn.LeakyReLU(0.2),
                  normalize=False, downsample=False):

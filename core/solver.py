@@ -164,9 +164,9 @@ class Solver(nn.Module):
                                         dtype=torch.long,
                                         device=x_fixed.device)
                         # 1) 用 EMA 的 style_encoder 生成风格向量
-                        s_t, s_aux = nets_ema.style_encoder(x_fixed, c_t)
+                        s_t = nets_ema.style_encoder(x_fixed, c_t)
                         # 2) 用 EMA 的 generator 做翻译
-                        x_fake = nets_ema.generator(x_fixed, s_t, s_aux)  # [B,4,H,W]
+                        x_fake = nets_ema.generator(x_fixed, s_t)  # [B,4,H,W]
                         for idx in range(x_fake.size(0)):
                             raw = x_fake[idx]  # [4,H,W]
                             r, gr, gb, b = raw[0], raw[1], raw[2], raw[3]
@@ -284,8 +284,8 @@ class Solver(nn.Module):
             y_t = torch.full((B,), idx_t, device=self.device, dtype=torch.long)
 
             # —— Forward: O→T ——
-            s_t, s_aux_t = self.style_encoder_ema(x_t, y_t)
-            x_pred     = self.generator_ema(x_o, s_t, s_aux_t)
+            s_t        = self.style_encoder_ema(x_t, y_t)
+            x_pred     = self.generator_ema(x_o, s_t)
             x_pred_den = self.denorm(x_pred)
             x_t_den    = self.denorm(x_t)
 
@@ -297,8 +297,8 @@ class Solver(nn.Module):
             tot_ssim_f += ssim_f
 
             # —— Reverse: T→O ——
-            s_o, s_aux_o = self.style_encoder_ema(x_o, y_o)
-            x_rev   = self.generator_ema(x_t, s_o, s_aux_o)
+            s_o     = self.style_encoder_ema(x_o, y_o)
+            x_rev   = self.generator_ema(x_t, s_o)
             x_rev_den = self.denorm(x_rev)
             x_o_den   = self.denorm(x_o)
 
@@ -380,9 +380,9 @@ def compute_d_loss(nets, args, x_real, y_org, y_trg, z_trg=None, x_ref=None, mas
         if z_trg is not None:
             s_trg = nets.mapping_network(z_trg, y_trg)
         else:  # x_ref is not None
-            s_trg, s_aux = nets.style_encoder(x_ref, y_trg)
+            s_trg = nets.style_encoder(x_ref, y_trg)
 
-        x_fake = nets.generator(x_real, s_trg, s_aux, masks=masks)
+        x_fake = nets.generator(x_real, s_trg, masks=masks)
     out = nets.discriminator(x_fake, y_trg)
     loss_fake = adv_loss(out, 0)
 
@@ -402,14 +402,14 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, m
     if z_trgs is not None:
         s_trg = nets.mapping_network(z_trg, y_trg)
     else:
-        s_trg, s_aux = nets.style_encoder(x_ref, y_trg)
+        s_trg = nets.style_encoder(x_ref, y_trg)
 
-    x_fake = nets.generator(x_real, s_trg, s_aux, masks=masks)
+    x_fake = nets.generator(x_real, s_trg, masks=masks)
     out = nets.discriminator(x_fake, y_trg)
     loss_adv = adv_loss(out, 1)
 
     # style reconstruction loss
-    s_pred, s_aux = nets.style_encoder(x_fake, y_trg)
+    s_pred = nets.style_encoder(x_fake, y_trg)
     loss_sty = torch.mean(torch.abs(s_pred - s_trg))
 
     # diversity sensitive loss

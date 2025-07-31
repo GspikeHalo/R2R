@@ -106,6 +106,10 @@ class Solver(nn.Module):
             x_real, y_org = inputs.x_src, inputs.y_src
             x_ref, x_ref2, y_trg = inputs.x_ref, inputs.x_ref2, inputs.y_ref
 
+            x_real = nets.chan_gain(x_real, y_org)
+            x_ref = nets.chan_gain(x_ref, y_trg)
+            x_ref2 = nets.chan_gain(x_ref2, y_trg)
+
             masks = nets.fan.get_heatmap(x_real) if args.w_hpf > 0 else None
 
             d_loss, d_losses_ref = compute_d_loss(
@@ -119,7 +123,10 @@ class Solver(nn.Module):
             self._reset_grad()
             g_loss.backward()
             optims.generator.step()
+            optims.style_encoder.step()
+            optims.chan_gain.step()
 
+            moving_average(nets.chan_gain, nets_ema.chan_gain, beta=0.999)
             # compute moving average of network parameters
             moving_average(nets.generator, nets_ema.generator, beta=0.999)
             # moving_average(nets.mapping_network, nets_ema.mapping_network, beta=0.999)
@@ -211,13 +218,19 @@ class Solver(nn.Module):
         src = next(InputFetcher(loaders.src, None, args.latent_dim, 'test'))
         ref = next(InputFetcher(loaders.ref, None, args.latent_dim, 'test'))
 
+        x_src, y_src = src.x, src.y
+        x_ref, y_ref = ref.x, ref.y
+
+        x_src = nets_ema.chan_gain(x_src, y_src)
+        x_ref = nets_ema.chan_gain(x_ref, y_ref)
+
         fname = ospj(args.result_dir, 'reference.jpg')
         print('Working on {}...'.format(fname))
-        utils.translate_using_reference(nets_ema, args, src.x, ref.x, ref.y, fname)
+        utils.translate_using_reference(nets_ema, args, x_src, x_ref, y_ref, fname)
 
         fname = ospj(args.result_dir, 'video_ref.mp4')
         print('Working on {}...'.format(fname))
-        utils.video_ref(nets_ema, args, src.x, ref.x, ref.y, fname)
+        utils.video_ref(nets_ema, args, x_src, x_ref, y_ref, fname)
 
     @torch.no_grad()
     def evaluate(self):
@@ -282,6 +295,9 @@ class Solver(nn.Module):
             idx_t = domain2idx[domain_t_list[0]]
             y_o = torch.full((B,), idx_o, device=self.device, dtype=torch.long)
             y_t = torch.full((B,), idx_t, device=self.device, dtype=torch.long)
+
+            x_o = self.chan_gain_ema(x_o, y_o)
+            x_t = self.chan_gain_ema(x_t, y_t)
 
             # —— Forward: O→T ——
             s_t        = self.style_encoder_ema(x_t, y_t)

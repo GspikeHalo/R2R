@@ -19,6 +19,13 @@ import torch.nn.functional as F
 
 from core.wing import FAN
 
+class ChannelGainPerDomain(nn.Module):
+    def __init__(self, num_domains):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(num_domains, 4))
+    def forward(self, x, domain_idx):
+        w = self.gains[domain_idx].view(-1, 4, 1, 1)
+        return x * w
 
 class ResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, actv=nn.LeakyReLU(0.2),
@@ -289,20 +296,24 @@ class Discriminator(nn.Module):
 
 
 def build_model(args):
+    chan_gain = ChannelGainPerDomain(args.num_domains)
     generator = nn.DataParallel(Generator(args.img_size, args.style_dim, w_hpf=args.w_hpf))
     # generator = nn.DataParallel(Conformer(style_dim=args.style_dim))
     # mapping_network = nn.DataParallel(MappingNetwork(args.latent_dim, args.style_dim, args.num_domains))
     style_encoder = nn.DataParallel(StyleEncoder(args.img_size, args.style_dim, args.num_domains))
     discriminator = nn.DataParallel(Discriminator(args.img_size, args.num_domains))
+    chan_gain_ema = copy.deepcopy(chan_gain)
     generator_ema = copy.deepcopy(generator)
     # mapping_network_ema = copy.deepcopy(mapping_network)
     style_encoder_ema = copy.deepcopy(style_encoder)
 
-    nets = Munch(generator=generator,
+    nets = Munch(chan_gain=chan_gain,
+                 generator=generator,
                  # mapping_network=mapping_network,
                  style_encoder=style_encoder,
                  discriminator=discriminator)
-    nets_ema = Munch(generator=generator_ema,
+    nets_ema = Munch(chan_gain=chan_gain_ema,
+                     generator=generator_ema,
                      # mapping_network=mapping_network_ema,
                      style_encoder=style_encoder_ema)
 

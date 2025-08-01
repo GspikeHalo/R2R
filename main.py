@@ -49,7 +49,7 @@ def main(args):
             project='StarGAN-R2R',
             entity='bias-lab',
             config=vars(args),
-            name="stargan-v2_test"
+            name="stargan-v2-skip-conn"
         )
 
     solver = Solver(args)
@@ -211,15 +211,15 @@ if __name__ == '__main__':
                         help='Directory containing validation images')
     parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
                         help='Directory for saving generated images')
-    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-4/expr/checkpoints',
                         help='Directory for saving network checkpoints')
 
     # directory for calculating metrics
-    parser.add_argument('--eval_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/eval',
+    parser.add_argument('--eval_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-4/expr/eval',
                         help='Directory for saving metrics, i.e., FID and LPIPS')
 
     # directory for testing
-    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/results',
+    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-4/expr/results',
                         help='Directory for saving generated images and videos')
     parser.add_argument('--src_dir', type=str, default='assets/representative/celeba_hq/src',
                         help='Directory containing input source images')
@@ -235,8 +235,8 @@ if __name__ == '__main__':
     #                     help='output directory when aligning faces')
 
     # face alignment
-    parser.add_argument('--wing_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/checkpoints/wing.ckpt')
-    parser.add_argument('--lm_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-2/expr/checkpoints/celeba_lm_mean.npz')
+    parser.add_argument('--wing_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-4/expr/checkpoints/wing.ckpt')
+    parser.add_argument('--lm_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-4/expr/checkpoints/celeba_lm_mean.npz')
 
     # step size
     parser.add_argument('--print_every', type=int, default=10)

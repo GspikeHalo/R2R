@@ -1,13 +1,3 @@
-"""
-StarGAN v2
-Copyright (c) 2020-present NAVER Corp.
-
-This work is licensed under the Creative Commons Attribution-NonCommercial
-4.0 International License. To view a copy of this license, visit
-http://creativecommons.org/licenses/by-nc/4.0/ or send a letter to
-Creative Commons, PO Box 1866, Mountain View, CA 94042, USA.
-"""
-
 import os
 from os.path import join as ospj
 import time
@@ -81,6 +71,7 @@ class Solver(nn.Module):
             optim.zero_grad()
 
     def train(self, loaders):
+        torch.autograd.set_detect_anomaly(True)
         args = self.args
         nets = self.nets
         nets_ema = self.nets_ema
@@ -105,10 +96,6 @@ class Solver(nn.Module):
             inputs = next(fetcher)
             x_real, y_org = inputs.x_src, inputs.y_src
             x_ref, x_ref2, y_trg = inputs.x_ref, inputs.x_ref2, inputs.y_ref
-
-            x_real = nets.chan_gain(x_real, y_org)
-            x_ref = nets.chan_gain(x_ref, y_trg)
-            x_ref2 = nets.chan_gain(x_ref2, y_trg)
 
             masks = nets.fan.get_heatmap(x_real) if args.w_hpf > 0 else None
 
@@ -383,44 +370,40 @@ class Solver(nn.Module):
             }, step=step)
 
 
-def compute_d_loss(nets, args, x_real, y_org, y_trg, z_trg=None, x_ref=None, masks=None):
-    assert (z_trg is None) != (x_ref is None)
+def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref=None, masks=None):
+    assert x_ref is not None
+    x_real_cg = nets.chan_gain(x_real, y_org)
+    x_ref_cg = nets.chan_gain(x_ref, y_trg)
+
     # with real images
-    x_real.requires_grad_()
-    out = nets.discriminator(x_real, y_org)
-    loss_real = adv_loss(out, 1)
-    loss_reg = r1_reg(out, x_real)
+    x_real_cg.requires_grad_()
+    out_real = nets.discriminator(x_real_cg, y_org)
+    loss_real = adv_loss(out_real, 1)
+    loss_reg = r1_reg(out_real, x_real_cg)
 
-    # with fake images
+    # with fake images (reference-driven)
     with torch.no_grad():
-        if z_trg is not None:
-            s_trg = nets.mapping_network(z_trg, y_trg)
-        else:  # x_ref is not None
-            s_trg = nets.style_encoder(x_ref, y_trg)
-
-        x_fake = nets.generator(x_real, s_trg, masks=masks)
-    out = nets.discriminator(x_fake, y_trg)
-    loss_fake = adv_loss(out, 0)
+        s_trg = nets.style_encoder(x_ref_cg, y_trg)
+        x_fake = nets.generator(x_real_cg, s_trg, masks=masks)
+    out_fake = nets.discriminator(x_fake, y_trg)
+    loss_fake = adv_loss(out_fake, 0)
 
     loss = loss_real + loss_fake + args.lambda_reg * loss_reg
     return loss, Munch(real=loss_real.item(),
                        fake=loss_fake.item(),
                        reg=loss_reg.item())
 
-def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, masks=None):
-    assert (z_trgs is None) != (x_refs is None)
-    if z_trgs is not None:
-        z_trg, z_trg2 = z_trgs
-    if x_refs is not None:
-        x_ref, x_ref2 = x_refs
+def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs=None, masks=None):
+    assert x_refs is not None
+    x_ref, x_ref2 = x_refs
+
+    x_real_cg = nets.chan_gain(x_real, y_org)
+    x_ref_cg = nets.chan_gain(x_ref, y_trg)
+    x_ref2_cg = nets.chan_gain(x_ref2, y_trg)
 
     # adversarial loss
-    if z_trgs is not None:
-        s_trg = nets.mapping_network(z_trg, y_trg)
-    else:
-        s_trg = nets.style_encoder(x_ref, y_trg)
-
-    x_fake = nets.generator(x_real, s_trg, masks=masks)
+    s_trg = nets.style_encoder(x_ref_cg, y_trg)
+    x_fake = nets.generator(x_real_cg, s_trg, masks=masks)
     out = nets.discriminator(x_fake, y_trg)
     loss_adv = adv_loss(out, 1)
 
@@ -429,22 +412,18 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, m
     loss_sty = torch.mean(torch.abs(s_pred - s_trg))
 
     # diversity sensitive loss
-    if z_trgs is not None:
-        s_trg2 = nets.mapping_network(z_trg2, y_trg)
-    else:
-        s_trg2 = nets.style_encoder(x_ref2, y_trg)
-    x_fake2 = nets.generator(x_real, s_trg2, masks=masks)
-    x_fake2 = x_fake2.detach()
+    s_trg2 = nets.style_encoder(x_ref2_cg, y_trg)
+    x_fake2 = nets.generator(x_real_cg, s_trg2, masks=masks).detach()
     loss_ds = torch.mean(torch.abs(x_fake - x_fake2))
 
     # cycle-consistency loss
-    masks = nets.fan.get_heatmap(x_fake) if args.w_hpf > 0 else None
-    s_org = nets.style_encoder(x_real, y_org)
-    x_rec = nets.generator(x_fake, s_org, masks=masks)
-    loss_cyc = torch.mean(torch.abs(x_rec - x_real))
+    masks_cyc = nets.fan.get_heatmap(x_fake) if args.w_hpf > 0 else None
+    s_org = nets.style_encoder(x_real_cg, y_org)
+    x_rec = nets.generator(x_fake, s_org, masks=masks_cyc)
+    loss_cyc = torch.mean(torch.abs(x_rec - x_real_cg))
 
     loss = loss_adv + args.lambda_sty * loss_sty \
-        - args.lambda_ds * loss_ds + args.lambda_cyc * loss_cyc
+           - args.lambda_ds * loss_ds + args.lambda_cyc * loss_cyc
     return loss, Munch(adv=loss_adv.item(),
                        sty=loss_sty.item(),
                        ds=loss_ds.item(),

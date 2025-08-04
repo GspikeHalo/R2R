@@ -189,8 +189,6 @@ class Generator(nn.Module):
             self.hpf = HighPass(w_hpf, device)
 
     def forward(self, x, s, y, masks=None):
-        x = self.chan_gain(x, y)
-
         x = self.from_rgb(x)
         cache = {}
         skips = []
@@ -208,10 +206,13 @@ class Generator(nn.Module):
             x = x + skip
             if masks is not None and x.size(2) in [32, 64, 128]:
                 mask = masks[0] if x.size(2) == 32 else masks[1]
-                mask = F.interpolate(mask, size=x.size(2), mode='bicubic', align_corners=False)
+                mask = F.interpolate(mask, size=x.shape[2:], mode='bicubic', align_corners=False)
                 x = x + self.hpf(mask * cache[x.size(2)])
 
-        return self.to_rgb(x)
+        x = self.to_rgb(x)
+        x = self.chan_gain(x, y)
+        return x
+
 
 
 class MappingNetwork(nn.Module):
@@ -252,7 +253,6 @@ class StyleEncoder(nn.Module):
         dim_in = 2**14 // img_size
         blocks = []
 
-        self.chan_gain = ChannelGainPerDomain(num_domains)
         blocks += [nn.Conv2d(4, dim_in, 3, 1, 1)]
 
         repeat_num = int(np.log2(img_size)) - 2
@@ -271,7 +271,6 @@ class StyleEncoder(nn.Module):
             self.unshared += [nn.Linear(dim_out, style_dim)]
 
     def forward(self, x, y):
-        x = self.chan_gain(x, y)
         h = self.shared(x)
         h = h.view(h.size(0), -1)
         out = []
@@ -288,7 +287,6 @@ class Discriminator(nn.Module):
         super().__init__()
         dim_in = 2**14 // img_size
         blocks = []
-        self.chan_gain = ChannelGainPerDomain(num_domains)
         blocks += [nn.Conv2d(4, dim_in, 3, 1, 1)]
 
         repeat_num = int(np.log2(img_size)) - 2
@@ -304,7 +302,6 @@ class Discriminator(nn.Module):
         self.main = nn.Sequential(*blocks)
 
     def forward(self, x, y):
-        x = self.chan_gain(x, y)
         out = self.main(x)
         out = out.view(out.size(0), -1)  # (batch, num_domains)
         idx = torch.LongTensor(range(y.size(0))).to(y.device)

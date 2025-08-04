@@ -22,8 +22,7 @@ from core.wing import FAN
 class ChannelGainPerDomain(nn.Module):
     def __init__(self, num_domains, noise_std=0.01):
         super().__init__()
-        # inv_softplus(1) makes softplus(raw) ≈ 1; add small normal noise for symmetry breaking
-        neutral = torch.log(torch.exp(torch.tensor(1.0)) - 1)  # inverse softplus of 1
+        neutral = torch.log(torch.exp(torch.tensor(1.0)) - 1)
         init = neutral + torch.randn(num_domains, 4) * noise_std
         self.raw_gains = nn.Parameter(init)
         self.softplus = nn.Softplus()
@@ -35,10 +34,6 @@ class ChannelGainPerDomain(nn.Module):
     def inverse(self, x_cg, domain_idx, eps=1e-6):
         w = self.softplus(self.raw_gains[domain_idx]).view(-1, 4, 1, 1)
         return x_cg / (w + eps)
-
-    def reg_loss(self):
-        w = self.softplus(self.raw_gains)  # shape: (num_domains, 4)
-        return (torch.log(w) ** 2).mean()
 
 class ResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, actv=nn.LeakyReLU(0.2),

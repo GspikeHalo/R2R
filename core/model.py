@@ -20,9 +20,12 @@ import torch.nn.functional as F
 from core.wing import FAN
 
 class ChannelGainPerDomain(nn.Module):
-    def __init__(self, num_domains):
+    def __init__(self, num_domains, noise_std=0.01):
         super().__init__()
-        self.raw_gains = nn.Parameter(torch.zeros(num_domains, 4))
+        # inv_softplus(1) 使得 softplus(raw) ≈ 1（中性），再加小扰动
+        neutral = torch.log(torch.exp(torch.tensor(1.0)) - 1)  # ≈ 0.5413
+        init = neutral + torch.randn(num_domains, 4) * noise_std
+        self.raw_gains = nn.Parameter(init)
         self.softplus = nn.Softplus()
 
     def forward(self, x, domain_idx):

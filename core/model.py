@@ -19,6 +19,19 @@ import torch.nn.functional as F
 
 from core.wing import FAN
 
+class ChannelGainPerDomain(nn.Module):
+    def __init__(self, num_domains):
+        super().__init__()
+        self.raw_gains = nn.Parameter(torch.zeros(num_domains, 4))
+        self.softplus = nn.Softplus()
+
+    def forward(self, x, domain_idx):
+        w = self.softplus(self.raw_gains[domain_idx]).view(-1, 4, 1, 1)
+        return x * w
+
+    def inverse(self, x_cg, domain_idx, eps=1e-6):
+        w = self.softplus(self.raw_gains[domain_idx]).view(-1, 4, 1, 1)
+        return x_cg / (w + eps)
 
 class ResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, actv=nn.LeakyReLU(0.2),
@@ -134,10 +147,11 @@ class HighPass(nn.Module):
 
 
 class Generator(nn.Module):
-    def __init__(self, img_size=256, style_dim=64, max_conv_dim=512, w_hpf=1):
+    def __init__(self, img_size=256, style_dim=64, max_conv_dim=512, w_hpf=1, num_domain=2):
         super().__init__()
         dim_in = 2**14 // img_size
         self.img_size = img_size
+        self.chan_gain = ChannelGainPerDomain(num_domain)
         self.from_rgb = nn.Conv2d(4, dim_in, 3, 1, 1)
         self.encode = nn.ModuleList()
         self.decode = nn.ModuleList()
@@ -171,7 +185,9 @@ class Generator(nn.Module):
                 'cuda' if torch.cuda.is_available() else 'cpu')
             self.hpf = HighPass(w_hpf, device)
 
-    def forward(self, x, s, masks=None):
+    def forward(self, x, s, y, masks=None):
+        x = self.chan_gain(x, y)
+
         x = self.from_rgb(x)
         cache = {}
         skips = []
@@ -232,6 +248,8 @@ class StyleEncoder(nn.Module):
         super().__init__()
         dim_in = 2**14 // img_size
         blocks = []
+
+        self.chan_gain = ChannelGainPerDomain(num_domains)
         blocks += [nn.Conv2d(4, dim_in, 3, 1, 1)]
 
         repeat_num = int(np.log2(img_size)) - 2
@@ -250,6 +268,7 @@ class StyleEncoder(nn.Module):
             self.unshared += [nn.Linear(dim_out, style_dim)]
 
     def forward(self, x, y):
+        x = self.chan_gain(x, y)
         h = self.shared(x)
         h = h.view(h.size(0), -1)
         out = []
@@ -266,6 +285,7 @@ class Discriminator(nn.Module):
         super().__init__()
         dim_in = 2**14 // img_size
         blocks = []
+        self.chan_gain = ChannelGainPerDomain(num_domains)
         blocks += [nn.Conv2d(4, dim_in, 3, 1, 1)]
 
         repeat_num = int(np.log2(img_size)) - 2
@@ -281,6 +301,7 @@ class Discriminator(nn.Module):
         self.main = nn.Sequential(*blocks)
 
     def forward(self, x, y):
+        x = self.chan_gain(x, y)
         out = self.main(x)
         out = out.view(out.size(0), -1)  # (batch, num_domains)
         idx = torch.LongTensor(range(y.size(0))).to(y.device)
@@ -289,7 +310,7 @@ class Discriminator(nn.Module):
 
 
 def build_model(args):
-    generator = nn.DataParallel(Generator(args.img_size, args.style_dim, w_hpf=args.w_hpf))
+    generator = nn.DataParallel(Generator(args.img_size, args.style_dim, w_hpf=args.w_hpf, num_domain=args.num_domains))
     # generator = nn.DataParallel(Conformer(style_dim=args.style_dim))
     # mapping_network = nn.DataParallel(MappingNetwork(args.latent_dim, args.style_dim, args.num_domains))
     style_encoder = nn.DataParallel(StyleEncoder(args.img_size, args.style_dim, args.num_domains))

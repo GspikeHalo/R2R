@@ -153,10 +153,10 @@ class Solver(nn.Module):
                 os.makedirs(args.sample_dir, exist_ok=True)
                 print(f"\n=== Iter {step}: sampling fixed val batch ===")
 
-                x_fixed = inputs_val.x_src    # Shape [B,4,H,W]
+                x_fixed = inputs_val.x_src  # Shape [B,4,H,W]
                 # 我们按每个目标域都做一次翻译
                 imgs_to_log = []
-                captions   = []
+                captions = []
                 with torch.no_grad():
                     nets_ema.generator.eval()
                     nets_ema.style_encoder.eval()
@@ -167,9 +167,13 @@ class Solver(nn.Module):
                         # 1) 用 EMA 的 style_encoder 生成风格向量
                         s_t = nets_ema.style_encoder(x_fixed, c_t)
                         # 2) 用 EMA 的 generator 做翻译
-                        x_fake = nets_ema.generator(x_fixed, s_t)  # [B,4,H,W]
-                        for idx in range(x_fake.size(0)):
-                            raw = x_fake[idx]  # [4,H,W]
+                        x_fake_cg = nets_ema.generator(x_fixed, s_t, c_t)  # [B,4,H,W]
+                        try:
+                            x_fake_raw = nets_ema.generator.chan_gain.inverse(x_fake_cg, c_t)
+                        except Exception:
+                            x_fake_raw = nets_ema.generator.module.chan_gain.inverse(x_fake_cg, c_t)
+                        for idx in range(x_fake_raw.size(0)):
+                            raw = x_fake_raw[idx]  # [4,H,W]
                             r, gr, gb, b = raw[0], raw[1], raw[2], raw[3]
                             g = 0.5 * (gr + gb)
                             rgb = torch.stack([r, g, b], dim=0)  # [3,H,W]
@@ -245,6 +249,12 @@ class Solver(nn.Module):
         self.generator_ema.eval()
         self.style_encoder_ema.eval()
 
+        def inverse_generator_output(x_cg, domain):
+            try:
+                return self.generator_ema.chan_gain.inverse(x_cg, domain)
+            except Exception:
+                return self.generator_ema.module.chan_gain.inverse(x_cg, domain)
+
         # 2) 指标累加
         tot_mae_f = tot_psnr_f = tot_ssim_f = 0.0
         tot_mae_r = tot_psnr_r = tot_ssim_r = 0.0
@@ -285,28 +295,30 @@ class Solver(nn.Module):
             y_t = torch.full((B,), idx_t, device=self.device, dtype=torch.long)
 
             # —— Forward: O→T ——
-            s_t        = self.style_encoder_ema(x_t, y_t)
-            x_pred     = self.generator_ema(x_o, s_t)
-            x_pred_den = self.denorm(x_pred)
-            x_t_den    = self.denorm(x_t)
+            s_t = self.style_encoder_ema(x_t, y_t)
+            x_pred_cg = self.generator_ema(x_o, s_t, y_t)  # normalized-space
+            x_pred_raw = inverse_generator_output(x_pred_cg, y_t)
+            x_pred_den = self.denorm(x_pred_raw)
+            x_t_den = self.denorm(x_t)  # target is raw
 
-            mae_f  = torch.abs(x_pred_den - x_t_den).view(B, -1).mean(dim=1).sum().item()
+            mae_f = torch.abs(x_pred_den - x_t_den).view(B, -1).mean(dim=1).sum().item()
             psnr_f = _psnr(x_pred_den, x_t_den).sum().item()
             ssim_f = ssim_fn(x_pred_den, x_t_den).sum().item()
-            tot_mae_f  += mae_f
+            tot_mae_f += mae_f
             tot_psnr_f += psnr_f
             tot_ssim_f += ssim_f
 
             # —— Reverse: T→O ——
-            s_o     = self.style_encoder_ema(x_o, y_o)
-            x_rev   = self.generator_ema(x_t, s_o)
-            x_rev_den = self.denorm(x_rev)
-            x_o_den   = self.denorm(x_o)
+            s_o = self.style_encoder_ema(x_o, y_o)
+            x_rev_cg = self.generator_ema(x_t, s_o, y_o)
+            x_rev_raw = inverse_generator_output(x_rev_cg, y_o)
+            x_rev_den = self.denorm(x_rev_raw)
+            x_o_den = self.denorm(x_o)
 
-            mae_r  = torch.abs(x_rev_den - x_o_den).view(B, -1).mean(dim=1).sum().item()
+            mae_r = torch.abs(x_rev_den - x_o_den).view(B, -1).mean(dim=1).sum().item()
             psnr_r = _psnr(x_rev_den, x_o_den).sum().item()
             ssim_r = ssim_fn(x_rev_den, x_o_den).sum().item()
-            tot_mae_r  += mae_r
+            tot_mae_r += mae_r
             tot_psnr_r += psnr_r
             tot_ssim_r += ssim_r
 
@@ -332,10 +344,10 @@ class Solver(nn.Module):
                                f"{self.args.result_dir}/batch{batch_i:03d}_idx{k:03d}_rev.png",
                                nrow=3)
 
-        avg_mae_f  = tot_mae_f  / tot_imgs
+        avg_mae_f = tot_mae_f / tot_imgs
         avg_psnr_f = tot_psnr_f / tot_imgs
         avg_ssim_f = tot_ssim_f / tot_imgs
-        avg_mae_r  = tot_mae_r  / tot_imgs
+        avg_mae_r = tot_mae_r / tot_imgs
         avg_psnr_r = tot_psnr_r / tot_imgs
         avg_ssim_r = tot_ssim_r / tot_imgs
 
@@ -356,7 +368,7 @@ class Solver(nn.Module):
         if self.args.use_wandb:
             import wandb
             wandb.log({
-                'Test/MAE_forward':  avg_mae_f,
+                'Test/MAE_forward': avg_mae_f,
                 'Test/MAE_reverse': avg_mae_r,
                 'Test/MAE': avg_mae,
                 'Test/SSIM_forward': avg_ssim_f,
@@ -383,7 +395,7 @@ def compute_d_loss(nets, args, x_real, y_org, y_trg, z_trg=None, x_ref=None, mas
         else:  # x_ref is not None
             s_trg = nets.style_encoder(x_ref, y_trg)
 
-        x_fake = nets.generator(x_real, s_trg, masks=masks)
+        x_fake = nets.generator(x_real, s_trg, y_trg, masks=masks)
     out = nets.discriminator(x_fake, y_trg)
     loss_fake = adv_loss(out, 0)
 
@@ -405,7 +417,7 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, m
     else:
         s_trg = nets.style_encoder(x_ref, y_trg)
 
-    x_fake = nets.generator(x_real, s_trg, masks=masks)
+    x_fake = nets.generator(x_real, s_trg, y_trg, masks=masks)
     out = nets.discriminator(x_fake, y_trg)
     loss_adv = adv_loss(out, 1)
 
@@ -418,15 +430,16 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, m
         s_trg2 = nets.mapping_network(z_trg2, y_trg)
     else:
         s_trg2 = nets.style_encoder(x_ref2, y_trg)
-    x_fake2 = nets.generator(x_real, s_trg2, masks=masks)
+    x_fake2 = nets.generator(x_real, s_trg2, y_trg, masks=masks)
     x_fake2 = x_fake2.detach()
     loss_ds = torch.mean(torch.abs(x_fake - x_fake2))
 
     # cycle-consistency loss
     masks = nets.fan.get_heatmap(x_fake) if args.w_hpf > 0 else None
     s_org = nets.style_encoder(x_real, y_org)
-    x_rec = nets.generator(x_fake, s_org, masks=masks)
-    loss_cyc = torch.mean(torch.abs(x_rec - x_real))
+    x_rec = nets.generator(x_fake, s_org, y_org, masks=masks)
+    x_rec_raw = nets.generator.chan_gain.inverse(x_rec, y_org)
+    loss_cyc = torch.mean(torch.abs(x_rec_raw - x_real))
 
     loss = loss_adv + args.lambda_sty * loss_sty \
         - args.lambda_ds * loss_ds + args.lambda_cyc * loss_cyc

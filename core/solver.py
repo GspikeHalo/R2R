@@ -29,6 +29,9 @@ from torchvision.utils import save_image
 
 import wandb
 
+def unwrap(model):
+    return model.module if hasattr(model, 'module') else model
+
 class Solver(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -169,7 +172,10 @@ class Solver(nn.Module):
                         # 2) 用 EMA 的 generator 做翻译
                         x_fake_cg = nets_ema.generator(x_fixed, s_t, c_t)  # [B,4,H,W]
                         try:
-                            x_fake_raw = nets_ema.generator.chan_gain.inverse(x_fake_cg, c_t)
+                            # x_fake_raw = nets_ema.generator.chan_gain.inverse(x_fake_cg, c_t)
+                            x_fake_cg = nets_ema.generator(x_fixed, s_t, c_t)
+                            gen_ema = unwrap(nets_ema.generator)
+                            x_fake_raw = gen_ema.chan_gain.inverse(x_fake_cg, c_t)
                         except Exception:
                             x_fake_raw = nets_ema.generator.module.chan_gain.inverse(x_fake_cg, c_t)
                         for idx in range(x_fake_raw.size(0)):
@@ -249,11 +255,12 @@ class Solver(nn.Module):
         self.generator_ema.eval()
         self.style_encoder_ema.eval()
 
+        # 统一 unwrap DataParallel，获取真正的 generator
+        gen_ema = unwrap(self.generator_ema)
+
+        # 用 unwrap 后的 generator 来做 inverse
         def inverse_generator_output(x_cg, domain):
-            try:
-                return self.generator_ema.chan_gain.inverse(x_cg, domain)
-            except Exception:
-                return self.generator_ema.module.chan_gain.inverse(x_cg, domain)
+            return gen_ema.chan_gain.inverse(x_cg, domain)
 
         # 2) 指标累加
         tot_mae_f = tot_psnr_f = tot_ssim_f = 0.0
@@ -301,12 +308,9 @@ class Solver(nn.Module):
             x_pred_den = self.denorm(x_pred_raw)
             x_t_den = self.denorm(x_t)  # target is raw
 
-            mae_f = torch.abs(x_pred_den - x_t_den).view(B, -1).mean(dim=1).sum().item()
-            psnr_f = _psnr(x_pred_den, x_t_den).sum().item()
-            ssim_f = ssim_fn(x_pred_den, x_t_den).sum().item()
-            tot_mae_f += mae_f
-            tot_psnr_f += psnr_f
-            tot_ssim_f += ssim_f
+            tot_mae_f += torch.abs(x_pred_den - x_t_den).view(B, -1).mean(1).sum().item()
+            tot_psnr_f += _psnr(x_pred_den, x_t_den).sum().item()
+            tot_ssim_f += ssim_fn(x_pred_den, x_t_den).sum().item()
 
             # —— Reverse: T→O ——
             s_o = self.style_encoder_ema(x_o, y_o)
@@ -315,17 +319,13 @@ class Solver(nn.Module):
             x_rev_den = self.denorm(x_rev_raw)
             x_o_den = self.denorm(x_o)
 
-            mae_r = torch.abs(x_rev_den - x_o_den).view(B, -1).mean(dim=1).sum().item()
-            psnr_r = _psnr(x_rev_den, x_o_den).sum().item()
-            ssim_r = ssim_fn(x_rev_den, x_o_den).sum().item()
-            tot_mae_r += mae_r
-            tot_psnr_r += psnr_r
-            tot_ssim_r += ssim_r
+            tot_mae_r += torch.abs(x_rev_den - x_o_den).view(B, -1).mean(1).sum().item()
+            tot_psnr_r += _psnr(x_rev_den, x_o_den).sum().item()
+            tot_ssim_r += ssim_fn(x_rev_den, x_o_den).sum().item()
 
-            # 5) 可视化三联图（每批次最多 5 张）
-            V = min(1, B)
+            # —— 可视化三联图（每批次最多 1 张） ——
             if not self.args.use_wandb:
-                for k in range(V):
+                for k in range(min(1, B)):
                     trip_f = torch.stack([
                         rggb2rgb(x_o_den[k]),
                         rggb2rgb(x_pred_den[k]),
@@ -352,18 +352,12 @@ class Solver(nn.Module):
         avg_ssim_r = tot_ssim_r / tot_imgs
 
         avg_mae = (avg_mae_f + avg_mae_r) / 2
-        avg_ssim = (avg_ssim_f + avg_ssim_r) / 2
         avg_psnr = (avg_psnr_f + avg_psnr_r) / 2
+        avg_ssim = (avg_ssim_f + avg_ssim_r) / 2
 
-        print(f'Forward  MAE:{avg_mae_f:.4f}, '
-              f'PSNR:{avg_psnr_f:.2f}, '
-              f'SSIM:{avg_ssim_f:.4f}')
-        print(f'Reverse  MAE:{avg_mae_r:.4f}, '
-              f'PSNR:{avg_psnr_r:.2f}, '
-              f'SSIM:{avg_ssim_r:.4f}')
-        print(f'Avg  MAE:{avg_mae:.4f}, '
-              f'PSNR:{avg_psnr:.2f}, '
-              f'SSIM:{avg_ssim:.4f}')
+        print(f'Forward  MAE:{avg_mae_f:.4f}, PSNR:{avg_psnr_f:.2f}, SSIM:{avg_ssim_f:.4f}')
+        print(f'Reverse  MAE:{avg_mae_r:.4f}, PSNR:{avg_psnr_r:.2f}, SSIM:{avg_ssim_r:.4f}')
+        print(f'Avg      MAE:{avg_mae:.4f}, PSNR:{avg_psnr:.2f}, SSIM:{avg_ssim:.4f}')
 
         if self.args.use_wandb:
             import wandb
@@ -438,7 +432,9 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, m
     masks = nets.fan.get_heatmap(x_fake) if args.w_hpf > 0 else None
     s_org = nets.style_encoder(x_real, y_org)
     x_rec = nets.generator(x_fake, s_org, y_org, masks=masks)
-    x_rec_raw = nets.generator.chan_gain.inverse(x_rec, y_org)
+    generator_for_cg = unwrap(nets.generator)
+    x_rec_raw = generator_for_cg.chan_gain.inverse(x_rec, y_org)
+
     loss_cyc = torch.mean(torch.abs(x_rec_raw - x_real))
 
     loss = loss_adv + args.lambda_sty * loss_sty \

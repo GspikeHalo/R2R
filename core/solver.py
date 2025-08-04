@@ -29,9 +29,6 @@ from torchvision.utils import save_image
 
 import wandb
 
-def unwrap(model):
-    return model.module if hasattr(model, 'module') else model
-
 class Solver(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -151,35 +148,26 @@ class Solver(nn.Module):
                     wandb.log(all_losses, step=i+1)
 
             # # generate images for debugging
-            if (i+1) % args.sample_every == 0:
-                step = i+1
+            if (i + 1) % args.sample_every == 0:
+                step = i + 1
                 os.makedirs(args.sample_dir, exist_ok=True)
                 print(f"\n=== Iter {step}: sampling fixed val batch ===")
 
                 x_fixed = inputs_val.x_src  # Shape [B,4,H,W]
-                # 我们按每个目标域都做一次翻译
                 imgs_to_log = []
                 captions = []
                 with torch.no_grad():
                     nets_ema.generator.eval()
                     nets_ema.style_encoder.eval()
-                    for domain in range(min(args.num_domains, 5)):  # 比如只看前5个域
+                    for domain in range(min(args.num_domains, 5)):
                         c_t = torch.full((x_fixed.size(0),), domain,
-                                        dtype=torch.long,
-                                        device=x_fixed.device)
-                        # 1) 用 EMA 的 style_encoder 生成风格向量
+                                         dtype=torch.long,
+                                         device=x_fixed.device)
                         s_t = nets_ema.style_encoder(x_fixed, c_t)
-                        # 2) 用 EMA 的 generator 做翻译
-                        x_fake_cg = nets_ema.generator(x_fixed, s_t, c_t)  # [B,4,H,W]
-                        try:
-                            # x_fake_raw = nets_ema.generator.chan_gain.inverse(x_fake_cg, c_t)
-                            x_fake_cg = nets_ema.generator(x_fixed, s_t, c_t)
-                            gen_ema = unwrap(nets_ema.generator)
-                            x_fake_raw = gen_ema.chan_gain.inverse(x_fake_cg, c_t)
-                        except Exception:
-                            x_fake_raw = nets_ema.generator.module.chan_gain.inverse(x_fake_cg, c_t)
-                        for idx in range(x_fake_raw.size(0)):
-                            raw = x_fake_raw[idx]  # [4,H,W]
+                        x_fake = nets_ema.generator(x_fixed, s_t, c_t)  # already in raw space
+
+                        for idx in range(x_fake.size(0)):
+                            raw = x_fake[idx]  # [4,H,W]
                             r, gr, gb, b = raw[0], raw[1], raw[2], raw[3]
                             g = 0.5 * (gr + gb)
                             rgb = torch.stack([r, g, b], dim=0)  # [3,H,W]
@@ -246,8 +234,6 @@ class Solver(nn.Module):
 
     @torch.no_grad()
     def test(self, step=None):
-        """对成对数据进行正向 (O→T) 和 反向 (T→O) 的 MAE / PSNR / SSIM 评估，并保存三联图。"""
-        # 1) 恢复 EMA 模型
         if step is None:
             step = self.args.resume_iter
 
@@ -255,38 +241,25 @@ class Solver(nn.Module):
         self.generator_ema.eval()
         self.style_encoder_ema.eval()
 
-        # 统一 unwrap DataParallel，获取真正的 generator
-        gen_ema = unwrap(self.generator_ema)
-
-        # 用 unwrap 后的 generator 来做 inverse
-        def inverse_generator_output(x_cg, domain):
-            return gen_ema.chan_gain.inverse(x_cg, domain)
-
-        # 2) 指标累加
         tot_mae_f = tot_psnr_f = tot_ssim_f = 0.0
         tot_mae_r = tot_psnr_r = tot_ssim_r = 0.0
         tot_imgs = 0
 
-        # PSNR 计算
         def _psnr(x, y, max_val=1.0, eps=1e-10):
-            mse = ((x - y)**2).mean(dim=[1,2,3])
-            return 10 * torch.log10(max_val**2 / (mse + eps))
+            mse = ((x - y) ** 2).mean(dim=[1, 2, 3])
+            return 10 * torch.log10(max_val ** 2 / (mse + eps))
 
-        # SSIM 函数（4 通道）
         ssim_fn = SSIM(data_range=1.0, channel=4, size_average=False).to(self.device)
 
-        # RGGB → RGB 用于可视化
         def rggb2rgb(img):
             r, gr, gb, b = img[0], img[1], img[2], img[3]
             g = 0.5 * (gr + gb)
             return torch.stack([r, g, b], dim=0)
 
-        # 3) 构建 domain→idx 映射（与 PairedNpyDataset 使用的子目录一致）
         domains = sorted(os.listdir(self.args.val_img_dir))
-        domain2idx = {d:i for i,d in enumerate(domains)}
+        domain2idx = {d: i for i, d in enumerate(domains)}
         os.makedirs(self.args.result_dir, exist_ok=True)
 
-        # 4) 遍历 paired loader
         for batch_i, (x_o, x_t, filenames, domain_o_list, domain_t_list) in enumerate(
                 tqdm(self.mydata_loader, desc='Testing')):
             B = x_o.size(0)
@@ -295,28 +268,25 @@ class Solver(nn.Module):
             x_o = x_o.to(self.device)
             x_t = x_t.to(self.device)
 
-            # 4.1) 构造标签向量
-            idx_o = domain2idx[domain_o_list[0]]  # PairedNpyDataset 保证同 batch 全一致
+            idx_o = domain2idx[domain_o_list[0]]
             idx_t = domain2idx[domain_t_list[0]]
             y_o = torch.full((B,), idx_o, device=self.device, dtype=torch.long)
             y_t = torch.full((B,), idx_t, device=self.device, dtype=torch.long)
 
-            # —— Forward: O→T ——
+            # Forward: O→T
             s_t = self.style_encoder_ema(x_t, y_t)
-            x_pred_cg = self.generator_ema(x_o, s_t, y_t)  # normalized-space
-            x_pred_raw = inverse_generator_output(x_pred_cg, y_t)
-            x_pred_den = self.denorm(x_pred_raw)
-            x_t_den = self.denorm(x_t)  # target is raw
+            x_pred = self.generator_ema(x_o, s_t, y_t)  # already in raw space
+            x_pred_den = self.denorm(x_pred)
+            x_t_den = self.denorm(x_t)
 
             tot_mae_f += torch.abs(x_pred_den - x_t_den).view(B, -1).mean(1).sum().item()
             tot_psnr_f += _psnr(x_pred_den, x_t_den).sum().item()
             tot_ssim_f += ssim_fn(x_pred_den, x_t_den).sum().item()
 
-            # —— Reverse: T→O ——
+            # Reverse: T→O
             s_o = self.style_encoder_ema(x_o, y_o)
-            x_rev_cg = self.generator_ema(x_t, s_o, y_o)
-            x_rev_raw = inverse_generator_output(x_rev_cg, y_o)
-            x_rev_den = self.denorm(x_rev_raw)
+            x_rev = self.generator_ema(x_t, s_o, y_o)
+            x_rev_den = self.denorm(x_rev)
             x_o_den = self.denorm(x_o)
 
             tot_mae_r += torch.abs(x_rev_den - x_o_den).view(B, -1).mean(1).sum().item()
@@ -432,10 +402,7 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, m
     masks = nets.fan.get_heatmap(x_fake) if args.w_hpf > 0 else None
     s_org = nets.style_encoder(x_real, y_org)
     x_rec = nets.generator(x_fake, s_org, y_org, masks=masks)
-    generator_for_cg = unwrap(nets.generator)
-    x_rec_raw = generator_for_cg.chan_gain.inverse(x_rec, y_org)
-
-    loss_cyc = torch.mean(torch.abs(x_rec_raw - x_real))
+    loss_cyc = torch.mean(torch.abs(x_rec - x_real))
 
     loss = loss_adv + args.lambda_sty * loss_sty \
         - args.lambda_ds * loss_ds + args.lambda_cyc * loss_cyc

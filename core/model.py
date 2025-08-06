@@ -194,39 +194,6 @@ class Generator(nn.Module):
 
         return self.to_rgb(x)
 
-
-class MappingNetwork(nn.Module):
-    def __init__(self, latent_dim=16, style_dim=64, num_domains=2):
-        super().__init__()
-        layers = []
-        layers += [nn.Linear(latent_dim, 512)]
-        layers += [nn.LeakyReLU()]
-        for _ in range(3):
-            layers += [nn.Linear(512, 512)]
-            layers += [nn.LeakyReLU()]
-        self.shared = nn.Sequential(*layers)
-
-        self.unshared = nn.ModuleList()
-        for _ in range(num_domains):
-            self.unshared += [nn.Sequential(nn.Linear(512, 512),
-                                            nn.LeakyReLU(),
-                                            nn.Linear(512, 512),
-                                            nn.LeakyReLU(),
-                                            nn.Linear(512, 512),
-                                            nn.LeakyReLU(),
-                                            nn.Linear(512, style_dim))]
-
-    def forward(self, z, y):
-        h = self.shared(z)
-        out = []
-        for layer in self.unshared:
-            out += [layer(h)]
-        out = torch.stack(out, dim=1)  # (batch, num_domains, style_dim)
-        idx = torch.LongTensor(range(y.size(0))).to(y.device)
-        s = out[idx, y]  # (batch, style_dim)
-        return s
-
-
 class StyleEncoder(nn.Module):
     def __init__(self, img_size=256, style_dim=64, num_domains=2, max_conv_dim=512):
         super().__init__()
@@ -290,8 +257,6 @@ class Discriminator(nn.Module):
 
 def build_model(args):
     generator = nn.DataParallel(Generator(args.img_size, args.style_dim, w_hpf=args.w_hpf))
-    # generator = nn.DataParallel(Conformer(style_dim=args.style_dim))
-    # mapping_network = nn.DataParallel(MappingNetwork(args.latent_dim, args.style_dim, args.num_domains))
     style_encoder = nn.DataParallel(StyleEncoder(args.img_size, args.style_dim, args.num_domains))
     discriminator = nn.DataParallel(Discriminator(args.img_size, args.num_domains))
     generator_ema = copy.deepcopy(generator)

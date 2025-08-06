@@ -404,31 +404,6 @@ def pad_mirror(img, landmarks):
     return img, landmarks
 
 
-def align_faces(args, input_dir, output_dir):
-    import os
-    from torchvision import transforms
-    from PIL import Image
-    from core.utils import save_image
-
-    aligner = FaceAligner(args.wing_path, args.lm_path, args.img_size)
-    transform = transforms.Compose([
-        transforms.Resize((args.img_size, args.img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5],
-                             std=[0.5, 0.5, 0.5]),
-    ])
-
-    fnames = os.listdir(input_dir)
-    os.makedirs(output_dir, exist_ok=True)
-    fnames.sort()
-    for fname in fnames:
-        image = Image.open(os.path.join(input_dir, fname)).convert('RGB')
-        x = transform(image).unsqueeze(0)
-        x_aligned = aligner.align(x)
-        save_image(x_aligned, 1, filename=os.path.join(output_dir, fname))
-        print('Saved the aligned image to %s...' % fname)
-
-
 # ========================== #
 #   Mask related functions   #
 # ========================== #

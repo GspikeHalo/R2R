@@ -9,19 +9,16 @@ Creative Commons, PO Box 1866, Mountain View, CA 94042, USA.
 """
 
 from pathlib import Path
-from itertools import chain
 import os
 import random
 
 from munch import Munch
-from PIL import Image
 import numpy as np
 
 import torch
 from torch.utils import data
 from torch.utils.data.sampler import WeightedRandomSampler
 from torchvision import transforms
-from torchvision.datasets import ImageFolder
 
 
 def listdir(dname):
@@ -115,6 +112,39 @@ class ReferenceDataset(data.Dataset):
     def __len__(self):
         return len(self.targets)
 
+class PairedNpyDataset(data.Dataset):
+    def __init__(self, root: str, domains: list[str], transform=None):
+        self.root = Path(root)
+        self.domains = domains
+        self.transform = transform
+        self.dirs = [self.root / d for d in domains]
+
+        sets = [set(p.name for p in d.glob("*.npy")) for d in self.dirs]
+        common = sorted(set.intersection(*sets))
+
+        if not common:
+            raise RuntimeError(f"No common .npy among {domains}")
+
+        self.pairs = [
+            [d / fname for d in self.dirs]
+            for fname in common
+        ]
+        self.filenames=common
+
+    def __len__(self):
+        return len(self.filenames)
+
+    def __getitem__(self, idx):
+        paths = self.pairs[idx]
+        imgs = {}
+        for domain, p in zip(self.domains, paths):
+            arr = np.load(str(p)) # (4, H, W)
+            img = torch.from_numpy(arr).float()
+            if self.transform:
+                img = self.transform(img)
+            imgs[domain] = img
+        return imgs, self.filenames[idx]
+
 
 def _make_balanced_sampler(labels):
     class_counts = np.bincount(labels)
@@ -156,38 +186,8 @@ def get_train_loader(root, which='source', img_size=256,
                            pin_memory=True,
                            drop_last=True)
 
-
-def get_eval_loader(root, img_size=256, batch_size=32,
-                    imagenet_normalize=True, shuffle=True,
-                    num_workers=4, drop_last=False):
-    print('Preparing DataLoader for the evaluation phase...')
-    if imagenet_normalize:
-        height, width = 299, 299
-        mean = [0.485, 0.456, 0.406]
-        std = [0.229, 0.224, 0.225]
-    else:
-        height, width = img_size, img_size
-        mean = [0.5, 0.5, 0.5]
-        std = [0.5, 0.5, 0.5]
-
-    transform = transforms.Compose([
-        transforms.Resize([img_size, img_size]),
-        transforms.Resize([height, width]),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std)
-    ])
-
-    dataset = DefaultDataset(root, transform=transform)
-    return data.DataLoader(dataset=dataset,
-                           batch_size=batch_size,
-                           shuffle=shuffle,
-                           num_workers=num_workers,
-                           pin_memory=True,
-                           drop_last=drop_last)
-
-
-def get_test_loader(root, img_size=256, batch_size=32,
-                    shuffle=True, num_workers=4):
+def get_test_loader(root, domains, img_size=256, batch_size=32,
+                    shuffle=False, num_workers=4):
     print('Preparing DataLoader for the generation phase (4-ch npy)...')
     transform = transforms.Compose([
         transforms.Resize([img_size, img_size]),
@@ -195,19 +195,22 @@ def get_test_loader(root, img_size=256, batch_size=32,
                              std =[0.5, 0.5, 0.5, 0.5]),
     ])
 
-    dataset = NpyFolder(root, transform=transform)
+    paired_ds = PairedNpyDataset(
+        root=root,
+        domains=domains,
+        transform=transform
+    )
 
-    return data.DataLoader(dataset=dataset,
+    return data.DataLoader(dataset=paired_ds,
                       batch_size=batch_size,
                       shuffle=shuffle,
                       num_workers=num_workers,
                       pin_memory=True)
 
 class InputFetcher:
-    def __init__(self, loader, loader_ref=None, latent_dim=16, mode=''):
+    def __init__(self, loader, loader_ref=None, mode=''):
         self.loader = loader
         self.loader_ref = loader_ref
-        self.latent_dim = latent_dim
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.mode = mode
 
@@ -237,53 +240,8 @@ class InputFetcher:
             x_ref, y_ref = self._fetch_inputs()
             inputs = Munch(x_src=x, y_src=y,
                            x_ref=x_ref, y_ref=y_ref)
-        elif self.mode == 'test':
-            inputs = Munch(x=x, y=y)
         else:
             raise NotImplementedError
 
         return Munch({k: v.to(self.device)
                       for k, v in inputs.items()})
-
-class PairedNpyDataset(data.Dataset):
-    """
-    返回 (img_o, img_t, filename, domain_o, domain_t)
-    """
-    def __init__(self, root: str, domain_o: str, domain_t: str, transform=None):
-        self.root     = Path(root)
-        self.domain_o = domain_o
-        self.domain_t = domain_t
-        self.transform = transform
-
-        self.dir_o = self.root / domain_o
-        self.dir_t = self.root / domain_t
-
-        # 找到两个域中都存在的 .npy 文件名
-        files_o = set(p.name for p in self.dir_o.glob('*.npy'))
-        files_t = set(p.name for p in self.dir_t.glob('*.npy'))
-        common = sorted(files_o & files_t)
-        if not common:
-            raise RuntimeError(f'No common files between {domain_o} and {domain_t}')
-
-        # 构造成对路径
-        self.pairs = [
-            (self.dir_o / fname, self.dir_t / fname)
-            for fname in common
-        ]
-
-    def __len__(self):
-        return len(self.pairs)
-
-    def __getitem__(self, idx):
-        path_o, path_t = self.pairs[idx]
-        arr_o = np.load(str(path_o))     # (4, H, W)
-        arr_t = np.load(str(path_t))
-        img_o = torch.from_numpy(arr_o).float()
-        img_t = torch.from_numpy(arr_t).float()
-
-        if self.transform:
-            img_o = self.transform(img_o)
-            img_t = self.transform(img_t)
-        domain_o_name = Path(self.domain_o).name
-        domain_t_name = Path(self.domain_t).name
-        return img_o, img_t, path_o.name, domain_o_name, domain_t_name

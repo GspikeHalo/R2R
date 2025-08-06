@@ -15,11 +15,9 @@ from munch import Munch
 from torch.backends import cudnn
 import torch
 
-from core.data_loader import get_train_loader, PairedNpyDataset
-from core.data_loader import get_test_loader
+from core.data_loader import get_train_loader, get_test_loader
 from core.solver import Solver
-from torchvision import transforms
-from torch.utils.data import DataLoader
+from pathlib import Path
 
 import wandb
 
@@ -38,6 +36,12 @@ def subdirs(dname):
     return [d for d in os.listdir(dname)
             if os.path.isdir(os.path.join(dname, d))]
 
+def getDomains(root_dir: str):
+    root = Path(root_dir)
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"Invalid directory: {root_dir}")
+    return sorted([p.name for p in root.iterdir() if p.is_dir()])
+
 
 def main(args):
     print(args)
@@ -49,7 +53,7 @@ def main(args):
             project='StarGAN-R2R',
             entity='bias-lab',
             config=vars(args),
-            name="stargan-v2-skip-conn"
+            name="raw2raw-base"
         )
 
     solver = Solver(args)
@@ -75,66 +79,16 @@ def main(args):
                                              batch_size=args.batch_size,
                                              prob=args.randcrop_prob,
                                              fixed_filenames=FIXINPUT))
-        transform = transforms.Compose([
-            transforms.Resize([args.img_size, args.img_size]),
-            transforms.Normalize(mean=[0.5,0.5,0.5,0.5],
-                                 std =[0.5,0.5,0.5,0.5]),
-        ])
-        paired_ds = PairedNpyDataset(
-            root      = args.val_img_dir,
-            domain_o  = args.domain_o,
-            domain_t  = args.domain_t,
-            transform = transform
-        )
-        paired_loader = DataLoader(
-            paired_ds,
-            batch_size   = args.val_batch_size,
-            shuffle      = False,
-            num_workers  = args.num_workers,
-            pin_memory   = True
-        )
 
-        solver.mydata_loader = paired_loader
+        domains=getDomains(args.val_img_dir)
+        solver.test_loader = get_test_loader(args.val_img_dir, domains, args.img_size, args.val_batch_size,
+                                               False, args.num_workers)
         solver.train(loaders)
-    elif args.mode == 'sample':
-        assert len(subdirs(args.src_dir)) == args.num_domains
-        assert len(subdirs(args.ref_dir)) == args.num_domains
-        loaders = Munch(src=get_test_loader(root=args.src_dir,
-                                            img_size=args.img_size,
-                                            batch_size=args.val_batch_size,
-                                            shuffle=False,
-                                            num_workers=args.num_workers),
-                        ref=get_test_loader(root=args.ref_dir,
-                                            img_size=args.img_size,
-                                            batch_size=args.val_batch_size,
-                                            shuffle=False,
-                                            num_workers=args.num_workers))
-        solver.sample(loaders)
     elif args.mode == 'eval':
-        transform = transforms.Compose([
-            transforms.Resize([args.img_size, args.img_size]),
-            transforms.Normalize(mean=[0.5,0.5,0.5,0.5],
-                                 std =[0.5,0.5,0.5,0.5]),
-        ])
-        paired_ds = PairedNpyDataset(
-            root      = args.val_img_dir,
-            domain_o  = args.domain_o,
-            domain_t  = args.domain_t,
-            transform = transform
-        )
-        paired_loader = DataLoader(
-            paired_ds,
-            batch_size   = args.val_batch_size,
-            shuffle      = False,
-            num_workers  = args.num_workers,
-            pin_memory   = True
-        )
-
-        solver.mydata_loader = paired_loader
+        domains = getDomains(args.val_img_dir)
+        solver.test_loader = get_test_loader(args.val_img_dir, domains, args.img_size, args.val_batch_size,
+                                               False, args.num_workers)
         solver.test()
-    elif args.mode == 'align':
-        from core.wing import align_faces
-        align_faces(args, args.inp_dir, args.out_dir)
     else:
         raise NotImplementedError
 
@@ -150,8 +104,6 @@ if __name__ == '__main__':
                         help='Image resolution')
     parser.add_argument('--num_domains', type=int, default=2,
                         help='Number of domains')
-    parser.add_argument('--latent_dim', type=int, default=16,
-                        help='Latent vector dimension')
     parser.add_argument('--hidden_dim', type=int, default=512,
                         help='Hidden dimension of mapping network')
     parser.add_argument('--style_dim', type=int, default=64,
@@ -225,14 +177,6 @@ if __name__ == '__main__':
                         help='Directory containing input source images')
     parser.add_argument('--ref_dir', type=str, default='assets/representative/celeba_hq/ref',
                         help='Directory containing input reference images')
-    parser.add_argument('--domain_o', type=str, default='//media/Data_2/R2RResult/processed/starganV2/test/iphone-x',
-                        help = 'Original domain name under val_img_dir for paired test')
-    parser.add_argument('--domain_t', type=str, default='/media/Data_2/R2RResult/processed/starganV2/test/samsung-s9',
-                        help = 'Target   domain name under val_img_dir for paired test')
-    # parser.add_argument('--inp_dir', type=str, default='assets/representative/custom/female',
-    #                     help='input directory when aligning faces')
-    # parser.add_argument('--out_dir', type=str, default='assets/representative/celeba_hq/src/female',
-    #                     help='output directory when aligning faces')
 
     # face alignment
     parser.add_argument('--wing_path', type=str, default='/media/Data_2/R2RResult/Results/starGanV2Test-4/expr/checkpoints/wing.ckpt')

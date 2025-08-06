@@ -23,7 +23,6 @@ from core.model import build_model
 from core.checkpoint import CheckpointIO
 from core.data_loader import InputFetcher
 import core.utils as utils
-from metrics.eval import calculate_metrics
 from tqdm import tqdm
 from torchvision.utils import save_image
 
@@ -50,7 +49,7 @@ class Solver(nn.Module):
                     continue
                 self.optims[net] = torch.optim.Adam(
                     params=self.nets[net].parameters(),
-                    lr=args.f_lr if net == 'mapping_network' else args.lr,
+                    lr=args.lr,
                     betas=[args.beta1, args.beta2],
                     weight_decay=args.weight_decay)
 
@@ -80,6 +79,15 @@ class Solver(nn.Module):
         for optim in self.optims.values():
             optim.zero_grad()
 
+    def denorm(self, x):
+        """Convert the range from [-1, 1] to [0, 1]."""
+        out = (x + 1) / 2
+        return out.clamp_(0, 1)
+
+    def rggb2rgb(self, img):
+        r, gr, gb, b = img[0], img[1], img[2], img[3]
+        return torch.stack([r, 0.5 * (gr + gb), b], 0)
+
     def train(self, loaders):
         args = self.args
         nets = self.nets
@@ -87,8 +95,8 @@ class Solver(nn.Module):
         optims = self.optims
 
         # fetch random validation images for debugging
-        fetcher = InputFetcher(loaders.src, loaders.ref, args.latent_dim, 'train')
-        fetcher_val = InputFetcher(loaders.val, None, args.latent_dim, 'val')
+        fetcher = InputFetcher(loaders.src, loaders.ref, 'train')
+        fetcher_val = InputFetcher(loaders.val, None, 'val')
         inputs_val = next(fetcher_val)
 
         # resume training if necessary
@@ -123,7 +131,6 @@ class Solver(nn.Module):
 
             # compute moving average of network parameters
             moving_average(nets.generator, nets_ema.generator, beta=0.999)
-            # moving_average(nets.mapping_network, nets_ema.mapping_network, beta=0.999)
             moving_average(nets.style_encoder, nets_ema.style_encoder, beta=0.999)
 
             # decay weight for diversity sensitive loss
@@ -147,48 +154,44 @@ class Solver(nn.Module):
                 if args.use_wandb:
                     wandb.log(all_losses, step=i+1)
 
-            # # generate images for debugging
+            # generate images for debugging
             if (i+1) % args.sample_every == 0:
                 step = i+1
                 os.makedirs(args.sample_dir, exist_ok=True)
                 print(f"\n=== Iter {step}: sampling fixed val batch ===")
 
-                x_fixed = inputs_val.x_src    # Shape [B,4,H,W]
-                # 我们按每个目标域都做一次翻译
+                x_fixed = inputs_val.x_src  # [B,4,H,W]
                 imgs_to_log = []
-                captions   = []
+
                 with torch.no_grad():
                     nets_ema.generator.eval()
                     nets_ema.style_encoder.eval()
-                    for domain in range(min(args.num_domains, 5)):  # 比如只看前5个域
-                        c_t = torch.full((x_fixed.size(0),), domain,
-                                        dtype=torch.long,
-                                        device=x_fixed.device)
-                        # 1) 用 EMA 的 style_encoder 生成风格向量
+                    for domain in range(args.num_domains):
+                        c_t = torch.full(
+                            (x_fixed.size(0),),
+                            domain,
+                            dtype=torch.long,
+                            device=x_fixed.device
+                        )
                         s_t = nets_ema.style_encoder(x_fixed, c_t)
-                        # 2) 用 EMA 的 generator 做翻译
+
                         x_fake = nets_ema.generator(x_fixed, s_t)  # [B,4,H,W]
-                        for idx in range(x_fake.size(0)):
-                            raw = x_fake[idx]  # [4,H,W]
-                            r, gr, gb, b = raw[0], raw[1], raw[2], raw[3]
-                            g = 0.5 * (gr + gb)
-                            rgb = torch.stack([r, g, b], dim=0)  # [3,H,W]
-                            rgb = (rgb + 1) * 0.5  # -> [0,1]
-                            arr = (rgb.permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
+                        x_fake_den = self.denorm(x_fake)
 
-                            from PIL import Image
-                            pil = Image.fromarray(arr)
-                            imgs_to_log.append(pil)
-                            captions.append(f"iter{step}_dom{domain}")
+                        for idx in range(x_fake_den.size(0)):
+                            fake_rgb = self.rggb2rgb(x_fake_den[idx])  # [3,H,W]
+                            if args.use_wandb:
+                                caption = (
+                                    f"step{step} | "
+                                    f"idx{idx} | "
+                                    f"target_domain{domain}"
+                                )
+                                imgs_to_log.append(
+                                    wandb.Image(fake_rgb, caption=caption)
+                                )
 
-                # 5) 上传到 WandB
                 if args.use_wandb:
-                    wandb.log({
-                        "val/fixed_samples": [
-                            wandb.Image(img, caption=cap)
-                            for img, cap in zip(imgs_to_log, captions)
-                        ]
-                    }, step=step)
+                    wandb.log({"val/fixed_samples": imgs_to_log}, step=step)
 
             # save model checkpoints
             if (i+1) % args.save_every == 0:
@@ -203,41 +206,7 @@ class Solver(nn.Module):
                 print(f"---Done test at iter (i+1) ===\n")
 
     @torch.no_grad()
-    def sample(self, loaders):
-        args = self.args
-        nets_ema = self.nets_ema
-        os.makedirs(args.result_dir, exist_ok=True)
-        self._load_checkpoint(args.resume_iter)
-
-        src = next(InputFetcher(loaders.src, None, args.latent_dim, 'test'))
-        ref = next(InputFetcher(loaders.ref, None, args.latent_dim, 'test'))
-
-        fname = ospj(args.result_dir, 'reference.jpg')
-        print('Working on {}...'.format(fname))
-        utils.translate_using_reference(nets_ema, args, src.x, ref.x, ref.y, fname)
-
-        fname = ospj(args.result_dir, 'video_ref.mp4')
-        print('Working on {}...'.format(fname))
-        utils.video_ref(nets_ema, args, src.x, ref.x, ref.y, fname)
-
-    @torch.no_grad()
-    def evaluate(self):
-        args = self.args
-        nets_ema = self.nets_ema
-        resume_iter = args.resume_iter
-        self._load_checkpoint(args.resume_iter)
-        calculate_metrics(nets_ema, args, step=resume_iter, mode='latent')
-        calculate_metrics(nets_ema, args, step=resume_iter, mode='reference')
-
-    def denorm(self, x):
-        """Convert the range from [-1, 1] to [0, 1]."""
-        out = (x + 1) / 2
-        return out.clamp_(0, 1)
-
-    @torch.no_grad()
     def test(self, step=None):
-        """对成对数据进行正向 (O→T) 和 反向 (T→O) 的 MAE / PSNR / SSIM 评估，并保存三联图。"""
-        # 1) 恢复 EMA 模型
         if step is None:
             step = self.args.resume_iter
 
@@ -245,144 +214,244 @@ class Solver(nn.Module):
         self.generator_ema.eval()
         self.style_encoder_ema.eval()
 
-        # 2) 指标累加
-        tot_mae_f = tot_psnr_f = tot_ssim_f = 0.0
-        tot_mae_r = tot_psnr_r = tot_ssim_r = 0.0
+        domains = sorted(os.listdir(self.args.val_img_dir))
+        domain2idx = {d: i for i, d in enumerate(domains)}  # {iphone:0}
+        pairs = [(s, t) for s in domains for t in domains if s != t]
+
+        tot = {
+            f"{s}->{t}": {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "count": 0}
+            for s, t in pairs
+        }
         tot_imgs = 0
 
-        # PSNR 计算
         def _psnr(x, y, max_val=1.0, eps=1e-10):
-            mse = ((x - y)**2).mean(dim=[1,2,3])
-            return 10 * torch.log10(max_val**2 / (mse + eps))
+            mse = ((x - y) ** 2).mean(dim=[1, 2, 3])
+            return 10 * torch.log10(max_val ** 2 / (mse + eps))
 
-        # SSIM 函数（4 通道）
         ssim_fn = SSIM(data_range=1.0, channel=4, size_average=False).to(self.device)
 
-        # RGGB → RGB 用于可视化
-        def rggb2rgb(img):
-            r, gr, gb, b = img[0], img[1], img[2], img[3]
-            g = 0.5 * (gr + gb)
-            return torch.stack([r, g, b], dim=0)
-
-        # 3) 构建 domain→idx 映射（与 PairedNpyDataset 使用的子目录一致）
-        domains = sorted(os.listdir(self.args.val_img_dir))
-        domain2idx = {d:i for i,d in enumerate(domains)}
-        os.makedirs(self.args.result_dir, exist_ok=True)
-
-        # 4) 遍历 paired loader
-        for batch_i, (x_o, x_t, filenames, domain_o_list, domain_t_list) in enumerate(
-                tqdm(self.mydata_loader, desc='Testing')):
-            B = x_o.size(0)
+        for batch_i, (imgs_dict, filenames) in enumerate(
+                tqdm(self.test_loader, desc="Testing")):
+            B = next(iter(imgs_dict.values())).size(0)
             tot_imgs += B
 
-            x_o = x_o.to(self.device)
-            x_t = x_t.to(self.device)
+            for d in domains:
+                imgs_dict[d] = imgs_dict[d].to(self.device)
 
-            # 4.1) 构造标签向量
-            idx_o = domain2idx[domain_o_list[0]]  # PairedNpyDataset 保证同 batch 全一致
-            idx_t = domain2idx[domain_t_list[0]]
-            y_o = torch.full((B,), idx_o, device=self.device, dtype=torch.long)
-            y_t = torch.full((B,), idx_t, device=self.device, dtype=torch.long)
+            for src, tgt in pairs:
+                x_src = imgs_dict[src]
+                x_tgt = imgs_dict[tgt]
 
-            # —— Forward: O→T ——
-            s_t        = self.style_encoder_ema(x_t, y_t)
-            x_pred     = self.generator_ema(x_o, s_t)
-            x_pred_den = self.denorm(x_pred)
-            x_t_den    = self.denorm(x_t)
+                y_tgt = torch.full((B,), domain2idx[tgt],
+                                   device=self.device, dtype=torch.long)
 
-            mae_f  = torch.abs(x_pred_den - x_t_den).view(B, -1).mean(dim=1).sum().item()
-            psnr_f = _psnr(x_pred_den, x_t_den).sum().item()
-            ssim_f = ssim_fn(x_pred_den, x_t_den).sum().item()
-            tot_mae_f  += mae_f
-            tot_psnr_f += psnr_f
-            tot_ssim_f += ssim_f
+                s_t = self.style_encoder_ema(x_tgt, y_tgt)
+                x_fake = self.generator_ema(x_src, s_t)
+                x_fake_den = self.denorm(x_fake)
+                x_tgt_den = self.denorm(x_tgt)
 
-            # —— Reverse: T→O ——
-            s_o     = self.style_encoder_ema(x_o, y_o)
-            x_rev   = self.generator_ema(x_t, s_o)
-            x_rev_den = self.denorm(x_rev)
-            x_o_den   = self.denorm(x_o)
+                mae = torch.abs(x_fake_den - x_tgt_den).view(B, -1) \
+                    .mean(dim=1).sum().item()
+                psnr = _psnr(x_fake_den, x_tgt_den).sum().item()
+                ssim = ssim_fn(x_fake_den, x_tgt_den).sum().item()
 
-            mae_r  = torch.abs(x_rev_den - x_o_den).view(B, -1).mean(dim=1).sum().item()
-            psnr_r = _psnr(x_rev_den, x_o_den).sum().item()
-            ssim_r = ssim_fn(x_rev_den, x_o_den).sum().item()
-            tot_mae_r  += mae_r
-            tot_psnr_r += psnr_r
-            tot_ssim_r += ssim_r
+                key = f"{src}->{tgt}"
+                tot[key]["mae"] += mae
+                tot[key]["psnr"] += psnr
+                tot[key]["ssim"] += ssim
+                tot[key]["count"] += B
 
-            # 5) 可视化三联图（每批次最多 5 张）
-            V = min(1, B)
-            if not self.args.use_wandb:
-                for k in range(V):
-                    trip_f = torch.stack([
-                        rggb2rgb(x_o_den[k]),
-                        rggb2rgb(x_pred_den[k]),
-                        rggb2rgb(x_t_den[k])
+                if not self.args.use_wandb:
+                    trip = torch.stack([
+                        self.rggb2rgb(self.denorm(x_src)[0]),
+                        self.rggb2rgb(x_fake_den[0]),
+                        self.rggb2rgb(x_tgt_den[0])
                     ], dim=0)
-                    save_image(trip_f,
-                               f"{self.args.result_dir}/batch{batch_i:03d}_idx{k:03d}_fwd.png",
-                               nrow=3)
+                    save_image(
+                        trip,
+                        f"{self.args.result_dir}/{src}2{tgt}_batch{batch_i}.png",
+                        nrow=3
+                    )
 
-                    trip_r = torch.stack([
-                        rggb2rgb(x_t_den[k]),
-                        rggb2rgb(x_rev_den[k]),
-                        rggb2rgb(x_o_den[k])
-                    ], dim=0)
-                    save_image(trip_r,
-                               f"{self.args.result_dir}/batch{batch_i:03d}_idx{k:03d}_rev.png",
-                               nrow=3)
+        # print per–pair metrics
+        for key, v in tot.items():
+            cnt = v["count"]
+            print(f"{key}  MAE:{v['mae'] / cnt:.4f} "
+                  f"PSNR:{v['psnr'] / cnt:.2f} "
+                  f"SSIM:{v['ssim'] / cnt:.4f}")
 
-        avg_mae_f  = tot_mae_f  / tot_imgs
-        avg_psnr_f = tot_psnr_f / tot_imgs
-        avg_ssim_f = tot_ssim_f / tot_imgs
-        avg_mae_r  = tot_mae_r  / tot_imgs
-        avg_psnr_r = tot_psnr_r / tot_imgs
-        avg_ssim_r = tot_ssim_r / tot_imgs
+        # print overall micro-average across all pairs
+        total_mae = sum(v["mae"] for v in tot.values())
+        total_psnr = sum(v["psnr"] for v in tot.values())
+        total_ssim = sum(v["ssim"] for v in tot.values())
+        total_count = sum(v["count"] for v in tot.values())
 
-        avg_mae = (avg_mae_f + avg_mae_r) / 2
-        avg_ssim = (avg_ssim_f + avg_ssim_r) / 2
-        avg_psnr = (avg_psnr_f + avg_psnr_r) / 2
+        avg_mae = total_mae / total_count
+        avg_psnr = total_psnr / total_count
+        avg_ssim = total_ssim / total_count
 
-        print(f'Forward  MAE:{avg_mae_f:.4f}, '
-              f'PSNR:{avg_psnr_f:.2f}, '
-              f'SSIM:{avg_ssim_f:.4f}')
-        print(f'Reverse  MAE:{avg_mae_r:.4f}, '
-              f'PSNR:{avg_psnr_r:.2f}, '
-              f'SSIM:{avg_ssim_r:.4f}')
-        print(f'Avg  MAE:{avg_mae:.4f}, '
-              f'PSNR:{avg_psnr:.2f}, '
-              f'SSIM:{avg_ssim:.4f}')
+        print(f"Avg all  MAE:{avg_mae:.4f} "
+              f"PSNR:{avg_psnr:.2f} "
+              f"SSIM:{avg_ssim:.4f}")
 
+        # -- WandB logging of evaluation metrics --
         if self.args.use_wandb:
-            import wandb
-            wandb.log({
-                'Test/MAE_forward':  avg_mae_f,
-                'Test/MAE_reverse': avg_mae_r,
-                'Test/MAE': avg_mae,
-                'Test/SSIM_forward': avg_ssim_f,
-                'Test/SSIM_reverse': avg_ssim_r,
-                'Test/SSIM': avg_ssim,
-                'Test/PSNR_forward': avg_psnr_f,
-                'Test/PSNR_reverse': avg_psnr_r,
-                'Test/PSNR': avg_psnr,
-            }, step=step)
+            metrics = {}
+            for key, v in tot.items():
+                cnt = v["count"]
+                metrics[f"{key}/MAE"] = v["mae"] / cnt
+                metrics[f"{key}/PSNR"] = v["psnr"] / cnt
+                metrics[f"{key}/SSIM"] = v["ssim"] / cnt
+            # also log the micro-averages
+            metrics["Avg/MAE"] = avg_mae
+            metrics["Avg/PSNR"] = avg_psnr
+            metrics["Avg/SSIM"] = avg_ssim
+            wandb.log(metrics, step=step)
+
+    # @torch.no_grad()
+    # def test(self, step=None):
+    #     """对成对数据进行正向 (O→T) 和 反向 (T→O) 的 MAE / PSNR / SSIM 评估，并保存三联图。"""
+    #     # 1) 恢复 EMA 模型
+    #     if step is None:
+    #         step = self.args.resume_iter
+    #
+    #     self._load_checkpoint(step)
+    #     self.generator_ema.eval()
+    #     self.style_encoder_ema.eval()
+    #
+    #     # 2) 指标累加
+    #     tot_mae_f = tot_psnr_f = tot_ssim_f = 0.0
+    #     tot_mae_r = tot_psnr_r = tot_ssim_r = 0.0
+    #     tot_imgs = 0
+    #
+    #     # PSNR 计算
+    #     def _psnr(x, y, max_val=1.0, eps=1e-10):
+    #         mse = ((x - y)**2).mean(dim=[1,2,3])
+    #         return 10 * torch.log10(max_val**2 / (mse + eps))
+    #
+    #     # SSIM 函数（4 通道）
+    #     ssim_fn = SSIM(data_range=1.0, channel=4, size_average=False).to(self.device)
+    #
+    #     # RGGB → RGB 用于可视化
+    #     def rggb2rgb(img):
+    #         r, gr, gb, b = img[0], img[1], img[2], img[3]
+    #         g = 0.5 * (gr + gb)
+    #         return torch.stack([r, g, b], dim=0)
+    #
+    #     # 3) 构建 domain→idx 映射（与 PairedNpyDataset 使用的子目录一致）
+    #     domains = sorted(os.listdir(self.args.val_img_dir))
+    #     domain2idx = {d:i for i,d in enumerate(domains)}
+    #     os.makedirs(self.args.result_dir, exist_ok=True)
+    #
+    #     # 4) 遍历 paired loader
+    #     for batch_i, (x_o, x_t, filenames, domain_o_list, domain_t_list) in enumerate(
+    #             tqdm(self.test_loader, desc='Testing')):
+    #         B = x_o.size(0)
+    #         tot_imgs += B
+    #
+    #         x_o = x_o.to(self.device)
+    #         x_t = x_t.to(self.device)
+    #
+    #         # 4.1) 构造标签向量
+    #         idx_o = domain2idx[domain_o_list[0]]  # PairedNpyDataset 保证同 batch 全一致
+    #         idx_t = domain2idx[domain_t_list[0]]
+    #         y_o = torch.full((B,), idx_o, device=self.device, dtype=torch.long)
+    #         y_t = torch.full((B,), idx_t, device=self.device, dtype=torch.long)
+    #
+    #         # —— Forward: O→T ——
+    #         s_t        = self.style_encoder_ema(x_t, y_t)
+    #         x_pred     = self.generator_ema(x_o, s_t)
+    #         x_pred_den = self.denorm(x_pred)
+    #         x_t_den    = self.denorm(x_t)
+    #
+    #         mae_f  = torch.abs(x_pred_den - x_t_den).view(B, -1).mean(dim=1).sum().item()
+    #         psnr_f = _psnr(x_pred_den, x_t_den).sum().item()
+    #         ssim_f = ssim_fn(x_pred_den, x_t_den).sum().item()
+    #         tot_mae_f  += mae_f
+    #         tot_psnr_f += psnr_f
+    #         tot_ssim_f += ssim_f
+    #
+    #         # —— Reverse: T→O ——
+    #         s_o     = self.style_encoder_ema(x_o, y_o)
+    #         x_rev   = self.generator_ema(x_t, s_o)
+    #         x_rev_den = self.denorm(x_rev)
+    #         x_o_den   = self.denorm(x_o)
+    #
+    #         mae_r  = torch.abs(x_rev_den - x_o_den).view(B, -1).mean(dim=1).sum().item()
+    #         psnr_r = _psnr(x_rev_den, x_o_den).sum().item()
+    #         ssim_r = ssim_fn(x_rev_den, x_o_den).sum().item()
+    #         tot_mae_r  += mae_r
+    #         tot_psnr_r += psnr_r
+    #         tot_ssim_r += ssim_r
+    #
+    #         # 5) 可视化三联图（每批次最多 5 张）
+    #         V = min(1, B)
+    #         if not self.args.use_wandb:
+    #             for k in range(V):
+    #                 trip_f = torch.stack([
+    #                     rggb2rgb(x_o_den[k]),
+    #                     rggb2rgb(x_pred_den[k]),
+    #                     rggb2rgb(x_t_den[k])
+    #                 ], dim=0)
+    #                 save_image(trip_f,
+    #                            f"{self.args.result_dir}/batch{batch_i:03d}_idx{k:03d}_fwd.png",
+    #                            nrow=3)
+    #
+    #                 trip_r = torch.stack([
+    #                     rggb2rgb(x_t_den[k]),
+    #                     rggb2rgb(x_rev_den[k]),
+    #                     rggb2rgb(x_o_den[k])
+    #                 ], dim=0)
+    #                 save_image(trip_r,
+    #                            f"{self.args.result_dir}/batch{batch_i:03d}_idx{k:03d}_rev.png",
+    #                            nrow=3)
+    #
+    #     avg_mae_f  = tot_mae_f  / tot_imgs
+    #     avg_psnr_f = tot_psnr_f / tot_imgs
+    #     avg_ssim_f = tot_ssim_f / tot_imgs
+    #     avg_mae_r  = tot_mae_r  / tot_imgs
+    #     avg_psnr_r = tot_psnr_r / tot_imgs
+    #     avg_ssim_r = tot_ssim_r / tot_imgs
+    #
+    #     avg_mae = (avg_mae_f + avg_mae_r) / 2
+    #     avg_ssim = (avg_ssim_f + avg_ssim_r) / 2
+    #     avg_psnr = (avg_psnr_f + avg_psnr_r) / 2
+    #
+    #     print(f'Forward  MAE:{avg_mae_f:.4f}, '
+    #           f'PSNR:{avg_psnr_f:.2f}, '
+    #           f'SSIM:{avg_ssim_f:.4f}')
+    #     print(f'Reverse  MAE:{avg_mae_r:.4f}, '
+    #           f'PSNR:{avg_psnr_r:.2f}, '
+    #           f'SSIM:{avg_ssim_r:.4f}')
+    #     print(f'Avg  MAE:{avg_mae:.4f}, '
+    #           f'PSNR:{avg_psnr:.2f}, '
+    #           f'SSIM:{avg_ssim:.4f}')
+    #
+    #     if self.args.use_wandb:
+    #         import wandb
+    #         wandb.log({
+    #             'Test/MAE_forward':  avg_mae_f,
+    #             'Test/MAE_reverse': avg_mae_r,
+    #             'Test/MAE': avg_mae,
+    #             'Test/SSIM_forward': avg_ssim_f,
+    #             'Test/SSIM_reverse': avg_ssim_r,
+    #             'Test/SSIM': avg_ssim,
+    #             'Test/PSNR_forward': avg_psnr_f,
+    #             'Test/PSNR_reverse': avg_psnr_r,
+    #             'Test/PSNR': avg_psnr,
+    #         }, step=step)
 
 
-def compute_d_loss(nets, args, x_real, y_org, y_trg, z_trg=None, x_ref=None, masks=None):
-    assert (z_trg is None) != (x_ref is None)
-    # with real images
+def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref, masks=None):
+    assert x_ref is not None
+
     x_real.requires_grad_()
     out = nets.discriminator(x_real, y_org)
     loss_real = adv_loss(out, 1)
     loss_reg = r1_reg(out, x_real)
 
-    # with fake images
     with torch.no_grad():
-        if z_trg is not None:
-            s_trg = nets.mapping_network(z_trg, y_trg)
-        else:  # x_ref is not None
-            s_trg = nets.style_encoder(x_ref, y_trg)
-
+        s_trg = nets.style_encoder(x_ref, y_trg)
         x_fake = nets.generator(x_real, s_trg, masks=masks)
     out = nets.discriminator(x_fake, y_trg)
     loss_fake = adv_loss(out, 0)
@@ -392,19 +461,11 @@ def compute_d_loss(nets, args, x_real, y_org, y_trg, z_trg=None, x_ref=None, mas
                        fake=loss_fake.item(),
                        reg=loss_reg.item())
 
-def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, masks=None):
-    assert (z_trgs is None) != (x_refs is None)
-    if z_trgs is not None:
-        z_trg, z_trg2 = z_trgs
-    if x_refs is not None:
-        x_ref, x_ref2 = x_refs
+def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, masks=None):
+    x_ref, x_ref2 = x_refs
 
     # adversarial loss
-    if z_trgs is not None:
-        s_trg = nets.mapping_network(z_trg, y_trg)
-    else:
-        s_trg = nets.style_encoder(x_ref, y_trg)
-
+    s_trg = nets.style_encoder(x_ref, y_trg)
     x_fake = nets.generator(x_real, s_trg, masks=masks)
     out = nets.discriminator(x_fake, y_trg)
     loss_adv = adv_loss(out, 1)
@@ -414,10 +475,7 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, z_trgs=None, x_refs=None, m
     loss_sty = torch.mean(torch.abs(s_pred - s_trg))
 
     # diversity sensitive loss
-    if z_trgs is not None:
-        s_trg2 = nets.mapping_network(z_trg2, y_trg)
-    else:
-        s_trg2 = nets.style_encoder(x_ref2, y_trg)
+    s_trg2 = nets.style_encoder(x_ref2, y_trg)
     x_fake2 = nets.generator(x_real, s_trg2, masks=masks)
     x_fake2 = x_fake2.detach()
     loss_ds = torch.mean(torch.abs(x_fake - x_fake2))

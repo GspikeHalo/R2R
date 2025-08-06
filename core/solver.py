@@ -45,8 +45,6 @@ class Solver(nn.Module):
         if args.mode == 'train':
             self.optims = Munch()
             for net in self.nets.keys():
-                if net == 'fan':
-                    continue
                 self.optims[net] = torch.optim.Adam(
                     params=self.nets[net].parameters(),
                     lr=args.lr,
@@ -62,8 +60,7 @@ class Solver(nn.Module):
 
         self.to(self.device)
         for name, network in self.named_children():
-            # Do not initialize the FAN parameters
-            if ('ema' not in name) and ('fan' not in name):
+            if 'ema' not in name:
                 print('Initializing %s...' % name)
                 network.apply(utils.he_init)
 
@@ -114,16 +111,14 @@ class Solver(nn.Module):
             x_real, y_org = inputs.x_src, inputs.y_src
             x_ref, x_ref2, y_trg = inputs.x_ref, inputs.x_ref2, inputs.y_ref
 
-            masks = nets.fan.get_heatmap(x_real) if args.w_hpf > 0 else None
-
             d_loss, d_losses_ref = compute_d_loss(
-                nets, args, x_real, y_org, y_trg, x_ref=x_ref, masks=masks)
+                nets, args, x_real, y_org, y_trg, x_ref=x_ref)
             self._reset_grad()
             d_loss.backward()
             optims.discriminator.step()
 
             g_loss, g_losses_ref = compute_g_loss(
-                nets, args, x_real, y_org, y_trg, x_refs=[x_ref, x_ref2], masks=masks)
+                nets, args, x_real, y_org, y_trg, x_refs=[x_ref, x_ref2])
             self._reset_grad()
             g_loss.backward()
             optims.generator.step()
@@ -308,7 +303,7 @@ class Solver(nn.Module):
             metrics["Avg/SSIM"] = avg_ssim
             wandb.log(metrics, step=step)
 
-def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref, masks=None):
+def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref):
     assert x_ref is not None
 
     x_real.requires_grad_()
@@ -318,7 +313,7 @@ def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref, masks=None):
 
     with torch.no_grad():
         s_trg = nets.style_encoder(x_ref, y_trg)
-        x_fake = nets.generator(x_real, s_trg, masks=masks)
+        x_fake = nets.generator(x_real, s_trg)
     out = nets.discriminator(x_fake, y_trg)
     loss_fake = adv_loss(out, 0)
 
@@ -327,12 +322,12 @@ def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref, masks=None):
                        fake=loss_fake.item(),
                        reg=loss_reg.item())
 
-def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, masks=None):
+def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs):
     x_ref, x_ref2 = x_refs
 
     # adversarial loss
     s_trg = nets.style_encoder(x_ref, y_trg)
-    x_fake = nets.generator(x_real, s_trg, masks=masks)
+    x_fake = nets.generator(x_real, s_trg)
     out = nets.discriminator(x_fake, y_trg)
     loss_adv = adv_loss(out, 1)
 
@@ -342,14 +337,13 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, masks=None):
 
     # diversity sensitive loss
     s_trg2 = nets.style_encoder(x_ref2, y_trg)
-    x_fake2 = nets.generator(x_real, s_trg2, masks=masks)
+    x_fake2 = nets.generator(x_real, s_trg2)
     x_fake2 = x_fake2.detach()
     loss_ds = torch.mean(torch.abs(x_fake - x_fake2))
 
     # cycle-consistency loss
-    masks = nets.fan.get_heatmap(x_fake) if args.w_hpf > 0 else None
     s_org = nets.style_encoder(x_real, y_org)
-    x_rec = nets.generator(x_fake, s_org, masks=masks)
+    x_rec = nets.generator(x_fake, s_org)
     loss_cyc = torch.mean(torch.abs(x_rec - x_real))
 
     loss = loss_adv + args.lambda_sty * loss_sty \

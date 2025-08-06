@@ -104,8 +104,6 @@ if __name__ == '__main__':
                         help='Image resolution')
     parser.add_argument('--num_domains', type=int, default=2,
                         help='Number of domains')
-    parser.add_argument('--hidden_dim', type=int, default=512,
-                        help='Hidden dimension of mapping network')
     parser.add_argument('--style_dim', type=int, default=64,
                         help='Style code dimension')
 
@@ -120,8 +118,6 @@ if __name__ == '__main__':
                         help='Weight for diversity sensitive loss')
     parser.add_argument('--ds_iter', type=int, default=100000,
                         help='Number of iterations to optimize diversity sensitive loss')
-    parser.add_argument('--w_hpf', type=float, default=0,
-                        help='weight for high-pass filtering')
 
     # training arguments
     parser.add_argument('--randcrop_prob', type=float, default=0.5,
@@ -136,20 +132,16 @@ if __name__ == '__main__':
                         help='Batch size for validation')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate for D, E and G')
-    parser.add_argument('--f_lr', type=float, default=1e-6,
-                        help='Learning rate for F')
     parser.add_argument('--beta1', type=float, default=0.0,
                         help='Decay rate for 1st moment of Adam')
     parser.add_argument('--beta2', type=float, default=0.99,
                         help='Decay rate for 2nd moment of Adam')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
                         help='Weight decay for optimizer')
-    parser.add_argument('--num_outs_per_domain', type=int, default=10,
-                        help='Number of generated images per domain during sampling')
 
     # misc
     parser.add_argument('--mode', type=str, required=True,
-                        choices=['train', 'sample', 'eval', 'align'],
+                        choices=['train', 'eval'],
                         help='This argument is used in solver')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of workers used in DataLoader')
@@ -166,21 +158,9 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-base/expr/checkpoints',
                         help='Directory for saving network checkpoints')
 
-    # directory for calculating metrics
-    parser.add_argument('--eval_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-base/expr/eval',
-                        help='Directory for saving metrics, i.e., FID and LPIPS')
-
     # directory for testing
     parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-base/expr/results',
                         help='Directory for saving generated images and videos')
-    parser.add_argument('--src_dir', type=str, default='assets/representative/celeba_hq/src',
-                        help='Directory containing input source images')
-    parser.add_argument('--ref_dir', type=str, default='assets/representative/celeba_hq/ref',
-                        help='Directory containing input reference images')
-
-    # face alignment
-    parser.add_argument('--wing_path', type=str, default='/media/Data_2/R2RResult/Results/r2r-base/expr/checkpoints/wing.ckpt')
-    parser.add_argument('--lm_path', type=str, default='/media/Data_2/R2RResult/Results/r2r-base/expr/checkpoints/celeba_lm_mean.npz')
 
     # step size
     parser.add_argument('--print_every', type=int, default=10)

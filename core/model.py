@@ -119,10 +119,10 @@ class Generator(nn.Module):
         super().__init__()
         dim_in = 2**14 // img_size
         self.img_size = img_size
-        self.from_rgb = nn.Conv2d(4, dim_in, 3, 1, 1)
+        self.from_raw = nn.Conv2d(4, dim_in, 3, 1, 1)
         self.encode = nn.ModuleList()
         self.decode = nn.ModuleList()
-        self.to_rgb = nn.Sequential(
+        self.to_raw = nn.Sequential(
             nn.InstanceNorm2d(dim_in, affine=True),
             nn.LeakyReLU(0.2),
             nn.Conv2d(dim_in, 4, 1, 1, 0))
@@ -145,7 +145,7 @@ class Generator(nn.Module):
                 0, AdainResBlk(dim_out, dim_out, style_dim))
 
     def forward(self, x, s):
-        x = self.from_rgb(x)
+        x = self.from_raw(x)
         skips = []
         for block in self.encode:
             skips.append(x)
@@ -157,7 +157,7 @@ class Generator(nn.Module):
             if skip.shape[2:] != x.shape[2:]:
                 skip = F.interpolate(skip, size=x.shape[2:], mode='bicubic', align_corners=False)
             x = x + skip
-        return self.to_rgb(x)
+        return self.to_raw(x)
 
 class StyleEncoder(nn.Module):
     def __init__(self, img_size=256, style_dim=64, num_domains=2, max_conv_dim=512):

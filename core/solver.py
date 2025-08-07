@@ -8,7 +8,7 @@ http://creativecommons.org/licenses/by-nc/4.0/ or send a letter to
 Creative Commons, PO Box 1866, Mountain View, CA 94042, USA.
 """
 
-import os
+import os, re
 from os.path import join as ospj
 import time
 import datetime
@@ -55,8 +55,22 @@ class Solver(nn.Module):
                 CheckpointIO(ospj(args.checkpoint_dir, '{:06d}_nets.ckpt'), data_parallel=True, **self.nets),
                 CheckpointIO(ospj(args.checkpoint_dir, '{:06d}_nets_ema.ckpt'), data_parallel=True, **self.nets_ema),
                 CheckpointIO(ospj(args.checkpoint_dir, '{:06d}_optims.ckpt'), **self.optims)]
+
+            self.best_ckptios = [
+                CheckpointIO(os.path.join(args.checkpoint_dir, 'best_nets.ckpt'), data_parallel=True, **self.nets),
+                CheckpointIO(os.path.join(args.checkpoint_dir, 'best_nets_ema.ckpt'), data_parallel=True, **self.nets_ema),
+                CheckpointIO(os.path.join(args.checkpoint_dir, 'best_optims.ckpt'), **self.optims),
+            ]
+
+            self.best_mae = float('inf')
         else:
-            self.ckptios = [CheckpointIO(ospj(args.checkpoint_dir, '{:06d}_nets_ema.ckpt'), data_parallel=True, **self.nets_ema)]
+            if self.args.best_model:
+                ema_template = os.path.join(self.args.checkpoint_dir, 'best_nets_ema.ckpt')
+                print("Eval mode: will load BEST EMA checkpoint")
+            else:
+                ema_template = ospj(self.args.checkpoint_dir, '{:06d}_nets_ema.ckpt')
+                print("Eval mode: will load STEP EMA checkpoint")
+            self.ckptios = [CheckpointIO(ema_template, data_parallel=True, **self.nets_ema)]
 
         self.to(self.device)
         for name, network in self.named_children():
@@ -189,15 +203,23 @@ class Solver(nn.Module):
                     wandb.log({"val/fixed_samples": imgs_to_log}, step=step)
 
             # save model checkpoints
-            if (i+1) % args.save_every == 0:
-                self._save_checkpoint(step=i+1)
+            if (i + 1) % args.save_every == 0:
+                step = i + 1
+                for fn in os.listdir(self.args.checkpoint_dir):
+                    if re.match(r'^\d+_.*\.ckpt$', fn):
+                        os.remove(os.path.join(self.args.checkpoint_dir, fn))
+                self._save_checkpoint(step=step)
+                print(f"⇒ Saved checkpoint for iter {step}, old step files have been removed.")
 
             # # compute FID and LPIPS if necessary
             if (i+1) % args.eval_every == 0:
-                # calculate_metrics(nets_ema, args, i+1, mode='latent')
-                # calculate_metrics(nets_ema, args, i+1, mode='reference')
                 print(f"\n===Iter {i+1}: running test() ===")
-                self.test(step=i+1)
+                current_mae = self.test(step=i+1)
+                if current_mae < self.best_mae:
+                    self.best_mae = current_mae
+                    print(f"New best MAE {current_mae:.4f}, saving best checkpoints…")
+                    for ckptio in self.best_ckptios:
+                        ckptio.save(step=i + 1)
                 print(f"---Done test at iter (i+1) ===\n")
 
     @torch.no_grad()
@@ -302,6 +324,8 @@ class Solver(nn.Module):
             metrics["Avg/PSNR"] = avg_psnr
             metrics["Avg/SSIM"] = avg_ssim
             wandb.log(metrics, step=step)
+
+        return avg_mae
 
 def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref):
     assert x_ref is not None

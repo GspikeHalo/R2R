@@ -60,59 +60,76 @@ class ResBlk(nn.Module):
         x = self._shortcut(x) + self._residual(x)
         return x / math.sqrt(2)  # unit variance
 
-
-class AdaIN(nn.Module):
-    def __init__(self, style_dim, num_features):
+class ModulatedConv2d(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, style_dim, demodulate=True, eps=1e-8):
         super().__init__()
-        self.norm = nn.InstanceNorm2d(num_features, affine=False)
-        self.fc = nn.Linear(style_dim, num_features*2)
+        self.eps = eps
+        self.demodulate = demodulate
+        self.weight = nn.Parameter(torch.randn(1, out_ch, in_ch, kernel_size, kernel_size))
+        self.style_fc = nn.Linear(style_dim, in_ch)
+        self.padding = kernel_size // 2
+        self.bias = nn.Parameter(torch.zeros(out_ch))
+        self.noise_weight = nn.Parameter(torch.zeros(out_ch))
+        self.scale = 1 / math.sqrt(in_ch * kernel_size * kernel_size)
 
     def forward(self, x, s):
-        h = self.fc(s)
-        h = h.view(h.size(0), h.size(1), 1, 1)
-        gamma, beta = torch.chunk(h, chunks=2, dim=1)
-        return (1 + gamma) * self.norm(x) + beta
+        B, C, H, W = x.shape
+        style = self.style_fc(s).view(B, 1, C, 1, 1)
+        w = self.weight * (style + 1)
 
+        if self.demodulate:
+            d = torch.rsqrt((w * w).sum([2, 3, 4]) + self.eps)  # [B, out_ch]
+            w = w * d.view(B, -1, 1, 1, 1)
 
-class AdainResBlk(nn.Module):
+        w = w * self.scale
+        x = x.view(1, -1, H, W)
+        w = w.view(B * w.size(1), w.size(2), w.size(3), w.size(4))
+
+        out = F.conv2d(x, w, padding=self.padding, groups=B)
+        out = out.view(B, -1, H, W)
+
+        out = out + self.bias.view(1, -1, 1, 1)
+        noise = torch.randn(B, 1, H, W, device=x.device)
+        out = out + noise * self.noise_weight.view(1, -1, 1, 1)
+        return out
+
+class ModulatedResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, style_dim=64,
                  actv=nn.LeakyReLU(0.2), upsample=False):
         super().__init__()
         self.actv = actv
         self.upsample = upsample
-        self.learned_sc = dim_in != dim_out
-        self._build_weights(dim_in, dim_out, style_dim)
+        self.learned_sc = (dim_in != dim_out)
 
-    def _build_weights(self, dim_in, dim_out, style_dim=64):
-        self.conv1 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
-        self.conv2 = nn.Conv2d(dim_out, dim_out, 3, 1, 1)
-        self.norm1 = AdaIN(style_dim, dim_in)
-        self.norm2 = AdaIN(style_dim, dim_out)
+        self.conv1 = ModulatedConv2d(dim_in, dim_out, 3, style_dim, demodulate=True)
+        self.conv2 = ModulatedConv2d(dim_out, dim_out, 3, style_dim, demodulate=True)
+
         if self.learned_sc:
             self.conv1x1 = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=False)
 
+        if self.upsample:
+            self.up = nn.Upsample(scale_factor=2, mode='bicubic')
+
     def _shortcut(self, x):
         if self.upsample:
-            x = F.interpolate(x, scale_factor=2, mode='bicubic')
+            x = self.up(x)
         if self.learned_sc:
             x = self.conv1x1(x)
         return x
 
     def _residual(self, x, s):
-        x = self.norm1(x, s)
-        x = self.actv(x)
         if self.upsample:
-            x = F.interpolate(x, scale_factor=2, mode='bicubic')
-        x = self.conv1(x)
-        x = self.norm2(x, s)
+            x = self.up(x)
+        x = self.conv1(x, s)
         x = self.actv(x)
-        x = self.conv2(x)
+        x = self.conv2(x, s)
+        x = self.actv(x)
         return x
 
     def forward(self, x, s):
-        out = self._residual(x, s)
-        out = (out + self._shortcut(x)) / math.sqrt(2)
-        return out
+        res = self._residual(x, s)
+        skip = self._shortcut(x)
+        return (res + skip) / math.sqrt(2)
 
 class Generator(nn.Module):
     def __init__(self, img_size=256, style_dim=64, max_conv_dim=512):
@@ -128,13 +145,13 @@ class Generator(nn.Module):
             nn.Conv2d(dim_in, 4, 1, 1, 0))
 
         # down/up-sampling blocks
-        repeat_num = int(np.log2(img_size)) - 4
+        repeat_num = int(math.log2(img_size)) - 4
         for _ in range(repeat_num):
             dim_out = min(dim_in*2, max_conv_dim)
             self.encode.append(
                 ResBlk(dim_in, dim_out, normalize=True, downsample=True))
             self.decode.insert(
-                0, AdainResBlk(dim_out, dim_in, style_dim, upsample=True))  # stack-like
+                0, ModulatedResBlk(dim_out, dim_in, style_dim, upsample=True))
             dim_in = dim_out
 
         # bottleneck blocks
@@ -142,7 +159,7 @@ class Generator(nn.Module):
             self.encode.append(
                 ResBlk(dim_out, dim_out, normalize=True))
             self.decode.insert(
-                0, AdainResBlk(dim_out, dim_out, style_dim))
+                0, ModulatedResBlk(dim_out, dim_out, style_dim))
 
     def forward(self, x, s):
         x = self.from_raw(x)

@@ -18,21 +18,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class ResBlk(nn.Module):
-    def __init__(self, dim_in, dim_out, actv=nn.LeakyReLU(0.2),
-                 normalize=False, downsample=False):
+    def __init__(self, dim_in, dim_out, actv=nn.LeakyReLU(0.2), downsample=False):
         super().__init__()
         self.actv = actv
-        self.normalize = normalize
         self.downsample = downsample
-        self.learned_sc = dim_in != dim_out
-        self._build_weights(dim_in, dim_out)
+        self.learned_sc = (dim_in != dim_out)
 
-    def _build_weights(self, dim_in, dim_out):
         self.conv1 = nn.Conv2d(dim_in, dim_in, 3, 1, 1)
         self.conv2 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
-        if self.normalize:
-            self.norm1 = nn.InstanceNorm2d(dim_in, affine=True)
-            self.norm2 = nn.InstanceNorm2d(dim_in, affine=True)
         if self.learned_sc:
             self.conv1x1 = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=False)
 
@@ -44,21 +37,18 @@ class ResBlk(nn.Module):
         return x
 
     def _residual(self, x):
-        if self.normalize:
-            x = self.norm1(x)
         x = self.actv(x)
         x = self.conv1(x)
         if self.downsample:
             x = F.avg_pool2d(x, 2)
-        if self.normalize:
-            x = self.norm2(x)
         x = self.actv(x)
         x = self.conv2(x)
         return x
 
     def forward(self, x):
-        x = self._shortcut(x) + self._residual(x)
-        return x / math.sqrt(2)  # unit variance
+        res = self._residual(x)
+        skip = self._shortcut(x)
+        return (res + skip) / math.sqrt(2)
 
 class ModulatedConv2d(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size, style_dim, demodulate=True, eps=1e-8):
@@ -76,20 +66,16 @@ class ModulatedConv2d(nn.Module):
         B, C, H, W = x.shape
         style = self.style_fc(s).view(B, 1, C, 1, 1)
         w = self.weight * (style + 1)
-
         if self.demodulate:
-            d = torch.rsqrt((w * w).sum([2, 3, 4]) + self.eps)  # [B, out_ch]
+            d = torch.rsqrt((w * w).sum([2, 3, 4]) + self.eps)
             w = w * d.view(B, -1, 1, 1, 1)
-
         w = w * self.scale
-        x = x.view(1, -1, H, W)
-        w = w.view(B * w.size(1), w.size(2), w.size(3), w.size(4))
-
-        out = F.conv2d(x, w, padding=self.padding, groups=B)
+        x_ = x.view(1, -1, H, W)
+        w_ = w.view(B * w.size(1), w.size(2), w.size(3), w.size(4))
+        out = F.conv2d(x_, w_, padding=self.padding, groups=B)
         out = out.view(B, -1, H, W)
-
         out = out + self.bias.view(1, -1, 1, 1)
-        noise = torch.randn(B, 1, H, W, device=x.device)
+        noise = torch.randn(B, 1, H, W, device=out.device)
         out = out + noise * self.noise_weight.view(1, -1, 1, 1)
         return out
 
@@ -100,13 +86,10 @@ class ModulatedResBlk(nn.Module):
         self.actv = actv
         self.upsample = upsample
         self.learned_sc = (dim_in != dim_out)
-
         self.conv1 = ModulatedConv2d(dim_in, dim_out, 3, style_dim, demodulate=True)
         self.conv2 = ModulatedConv2d(dim_out, dim_out, 3, style_dim, demodulate=True)
-
         if self.learned_sc:
             self.conv1x1 = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=False)
-
         if self.upsample:
             self.up = nn.Upsample(scale_factor=2, mode='bicubic')
 
@@ -139,27 +122,26 @@ class Generator(nn.Module):
         self.from_raw = nn.Conv2d(4, dim_in, 3, 1, 1)
         self.encode = nn.ModuleList()
         self.decode = nn.ModuleList()
-        self.to_raw = nn.Sequential(
-            nn.InstanceNorm2d(dim_in, affine=True),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(dim_in, 4, 1, 1, 0))
+        self.to_raw = nn.Conv2d(dim_in, 4, 1, 1, 0)
 
-        # down/up-sampling blocks
         repeat_num = int(math.log2(img_size)) - 4
         for _ in range(repeat_num):
-            dim_out = min(dim_in*2, max_conv_dim)
+            dim_out = min(dim_in * 2, max_conv_dim)
             self.encode.append(
-                ResBlk(dim_in, dim_out, normalize=True, downsample=True))
+                ResBlk(dim_in, dim_out, actv=nn.LeakyReLU(0.2), downsample=True)
+            )
             self.decode.insert(
-                0, ModulatedResBlk(dim_out, dim_in, style_dim, upsample=True))
+                0, ModulatedResBlk(dim_out, dim_in, style_dim, upsample=True)
+            )
             dim_in = dim_out
 
-        # bottleneck blocks
         for _ in range(2):
             self.encode.append(
-                ResBlk(dim_out, dim_out, normalize=True))
+                ResBlk(dim_out, dim_out, actv=nn.LeakyReLU(0.2), downsample=False)
+            )
             self.decode.insert(
-                0, ModulatedResBlk(dim_out, dim_out, style_dim))
+                0, ModulatedResBlk(dim_out, dim_out, style_dim)
+            )
 
     def forward(self, x, s):
         x = self.from_raw(x)
@@ -167,12 +149,11 @@ class Generator(nn.Module):
         for block in self.encode:
             skips.append(x)
             x = block(x)
-
         for idx, block in enumerate(self.decode):
             x = block(x, s)
             skip = skips[-idx-1]
             if skip.shape[2:] != x.shape[2:]:
-                skip = F.interpolate(skip, size=x.shape[2:], mode='bicubic', align_corners=False)
+                skip = F.interpolate(skip, size=x.shape[2:], mode='bicubic')
             x = x + skip
         return self.to_raw(x)
 

@@ -83,6 +83,9 @@ class AdainResBlk(nn.Module):
         self.learned_sc = dim_in != dim_out
         self._build_weights(dim_in, dim_out, style_dim)
 
+        self.noise_weight1 = nn.Parameter(torch.zeros(dim_out))
+        self.noise_weight2 = nn.Parameter(torch.zeros(dim_out))
+
     def _build_weights(self, dim_in, dim_out, style_dim=64):
         self.conv1 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
         self.conv2 = nn.Conv2d(dim_out, dim_out, 3, 1, 1)
@@ -93,7 +96,7 @@ class AdainResBlk(nn.Module):
 
     def _shortcut(self, x):
         if self.upsample:
-            x = F.interpolate(x, scale_factor=2, mode='bicubic')
+            x = F.interpolate(x, scale_factor=2, mode='bicubic', align_corners=False)
         if self.learned_sc:
             x = self.conv1x1(x)
         return x
@@ -102,17 +105,26 @@ class AdainResBlk(nn.Module):
         x = self.norm1(x, s)
         x = self.actv(x)
         if self.upsample:
-            x = F.interpolate(x, scale_factor=2, mode='bicubic')
+            x = F.interpolate(x, scale_factor=2, mode='bicubic', align_corners=False)
         x = self.conv1(x)
+
+        b, c, h, w = x.shape
+        noise1 = torch.randn(b, 1, h, w, device=x.device)
+        x = x + noise1 * self.noise_weight1.view(1, -1, 1, 1)
+
         x = self.norm2(x, s)
         x = self.actv(x)
         x = self.conv2(x)
+
+        noise2 = torch.randn(b, 1, x.shape[2], x.shape[3], device=x.device)
+        x = x + noise2 * self.noise_weight2.view(1, -1, 1, 1)
+
         return x
 
     def forward(self, x, s):
-        out = self._residual(x, s)
-        out = (out + self._shortcut(x)) / math.sqrt(2)
-        return out
+        res = self._residual(x, s)
+        skip = self._shortcut(x)
+        return (res + skip) / math.sqrt(2)
 
 class Generator(nn.Module):
     def __init__(self, img_size=256, style_dim=64, max_conv_dim=512):

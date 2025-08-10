@@ -116,6 +116,8 @@ if __name__ == '__main__':
                         help='Weight for style reconstruction loss')
     parser.add_argument('--lambda_ds', type=float, default=5,
                         help='Weight for diversity sensitive loss')
+    parser.add_argument('--lambda_noise', type=float, default=1.0,
+                        help='Weight for noise consistency loss')
     parser.add_argument('--ds_iter', type=int, default=100000,
                         help='Number of iterations to optimize diversity sensitive loss')
 
@@ -159,6 +161,8 @@ if __name__ == '__main__':
                         help='Directory for saving generated images')
     parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-base/expr/checkpoints',
                         help='Directory for saving network checkpoints')
+    parser.add_argument('--noise_profile_paths', type=str,
+                        default='./preprocess/noise_profiles/iphone_profile.pt,./preprocess/noise_profiles/samsung_profile.pt')
 
     # directory for testing
     parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-base/expr/results',
@@ -171,6 +175,11 @@ if __name__ == '__main__':
     parser.add_argument('--eval_every', type=int, default=5000)
 
     parser.add_argument('--use_wandb', action='store_true')
+
+    parser.add_argument('--noise_patch', type=int, default=16)
+    parser.add_argument('--noise_stride', type=int, default=16)
+    parser.add_argument('--noise_keep_ratio', type=float, default=0.3)
+    parser.add_argument('--noise_use_mad', type=str2bool, default=True)
 
     args = parser.parse_args()
     main(args)

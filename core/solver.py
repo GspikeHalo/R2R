@@ -42,6 +42,21 @@ class Solver(nn.Module):
         for name, module in self.nets_ema.items():
             setattr(self, name + '_ema', module)
 
+        self.noise_losses = None
+        if getattr(args, 'lambda_noise', 0.0) > 0 and getattr(args, 'noise_profile_paths', ''):
+            paths = [p for p in args.noise_profile_paths.split(',') if p]
+            import torch.nn as nn
+            self.noise_losses = nn.ModuleList([
+                NoiseHistogramLoss(
+                    p,
+                    patch_size=args.noise_patch,
+                    stride=args.noise_stride,
+                    keep_ratio=args.noise_keep_ratio,
+                    use_mad=args.noise_use_mad,
+                    device=self.device
+                ) for p in paths
+            ])
+
         if args.mode == 'train':
             self.optims = Munch()
             for net in self.nets.keys():
@@ -99,6 +114,21 @@ class Solver(nn.Module):
         r, gr, gb, b = img[0], img[1], img[2], img[3]
         return torch.stack([r, 0.5 * (gr + gb), b], 0)
 
+    def _noise_loss_batch(self, x_fake, y_trg):
+        if (self.noise_losses is None) or (self.args.lambda_noise <= 0):
+            return x_fake.new_zeros([])
+        x_lin = x_fake.mul(0.5).add(0.5).clamp(0, 1)
+        if len(self.noise_losses) == 1:
+            return self.noise_losses[0](x_lin)
+        tot = x_fake.new_zeros([])
+        used = 0
+        for d in y_trg.unique():
+            m = (y_trg == d)
+            if m.any():
+                tot = tot + self.noise_losses[d.item()](x_lin[m])
+                used += 1
+        return tot / max(used, 1)
+
     def train(self, loaders):
         args = self.args
         nets = self.nets
@@ -132,7 +162,10 @@ class Solver(nn.Module):
             optims.discriminator.step()
 
             g_loss, g_losses_ref = compute_g_loss(
-                nets, args, x_real, y_org, y_trg, x_refs=[x_ref, x_ref2])
+                nets, args, x_real, y_org, y_trg, x_refs=[x_ref, x_ref2],
+                noise_loss_fn=self._noise_loss_batch,
+                lambda_noise=args.lambda_noise
+            )
             self._reset_grad()
             g_loss.backward()
             optims.generator.step()
@@ -346,7 +379,7 @@ def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref):
                        fake=loss_fake.item(),
                        reg=loss_reg.item())
 
-def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs):
+def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None, lambda_noise=0.0):
     x_ref, x_ref2 = x_refs
 
     # adversarial loss
@@ -369,14 +402,11 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs):
     s_org = nets.style_encoder(x_real, y_org)
     x_rec = nets.generator(x_fake, s_org)
     loss_cyc = torch.mean(torch.abs(x_rec - x_real))
-
-    loss = loss_adv + args.lambda_sty * loss_sty \
-        - args.lambda_ds * loss_ds + args.lambda_cyc * loss_cyc
-    return loss, Munch(adv=loss_adv.item(),
-                       sty=loss_sty.item(),
-                       ds=loss_ds.item(),
-                       cyc=loss_cyc.item())
-
+    loss_noise = x_real.new_zeros([])
+    if (noise_loss_fn is not None) and (lambda_noise > 0):
+        loss_noise = noise_loss_fn(x_fake, y_trg)
+    loss = loss_adv + args.lambda_sty * loss_sty - args.lambda_ds * loss_ds + args.lambda_cyc * loss_cyc + lambda_noise * loss_noise
+    return loss, Munch(adv=loss_adv.item(), sty=loss_sty.item(), ds=loss_ds.item(), cyc=loss_cyc.item(), noise=loss_noise.item())
 
 def moving_average(model, model_test, beta=0.999):
     for param, param_test in zip(model.parameters(), model_test.parameters()):
@@ -398,6 +428,96 @@ def r1_reg(d_out, x_in):
         create_graph=True, retain_graph=True, only_inputs=True
     )[0]
     grad_dout2 = grad_dout.pow(2)
-    assert(grad_dout2.size() == x_in.size())
     reg = 0.5 * grad_dout2.view(batch_size, -1).sum(1).mean(0)
     return reg
+
+class NoiseHistogramLoss(nn.Module):
+    def __init__(self, profile_path, patch_size=16, stride=None, keep_ratio=None, use_mad=True, device='cuda', eps=1e-8):
+        super().__init__()
+        prof = torch.load(profile_path, map_location=device)
+        if isinstance(prof, dict) and 'profiles' in prof and 'bins' in prof:
+            centers = prof['bins'].to(device).float()
+            target = prof['profiles'].to(device).float()
+            if keep_ratio is None:
+                keep_ratio = float(prof.get('meta', {}).get('keep_ratio', 0.3))
+        else:
+            target = torch.as_tensor(prof, device=device).float().unsqueeze(0)
+            centers = torch.linspace(0, 1, target.shape[-1], device=device)
+            if keep_ratio is None: keep_ratio = 1.0
+        edges = torch.empty(centers.numel() + 1, device=device)
+        edges[0] = 0.0
+        edges[-1] = 1.0
+        if centers.numel() > 1:
+            edges[1:-1] = 0.5 * (centers[:-1] + centers[1:])
+        else:
+            edges[1:-1] = 1.0
+        self.patch_size = patch_size
+        self.stride = patch_size if stride is None else stride
+        self.keep_ratio = keep_ratio
+        self.use_mad = use_mad
+        self.eps = eps
+        self.register_buffer('bin_edges', edges)
+        self.register_buffer('target_profiles', target)
+        self.register_buffer('bin_centers', centers)
+        kx = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]], dtype=torch.float32, device=device).view(1,1,3,3)
+        ky = torch.tensor([[1,2,1],[0,0,0],[-1,-2,-1]], dtype=torch.float32, device=device).view(1,1,3,3)
+        self.register_buffer('kx', kx)
+        self.register_buffer('ky', ky)
+
+    def _sobel_mag(self, x):
+        b, c, h, w = x.shape
+        gx = torch.nn.functional.conv2d(x, self.kx.repeat(c,1,1,1), padding=1, groups=c)
+        gy = torch.nn.functional.conv2d(x, self.ky.repeat(c,1,1,1), padding=1, groups=c)
+        return torch.sqrt(gx*gx + gy*gy)
+
+    def _unfold(self, x):
+        p = x.unfold(2, self.patch_size, self.stride).unfold(3, self.patch_size, self.stride)
+        b, c, nh, nw, ph, pw = p.shape
+        return p.contiguous().view(b, c, nh*nw, ph*pw)
+
+    def _patch_var(self, patches):
+        if self.use_mad:
+            med = patches.median(dim=-1, keepdim=True).values
+            mad = (patches - med).abs().median(dim=-1).values
+            sigma = mad / 0.67448975
+            return sigma * sigma
+        else:
+            return patches.var(dim=-1, correction=0)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        Ct, Nb = self.target_profiles.shape
+        if Ct == 1 and C > 1:
+            tgt = self.target_profiles.expand(C, Nb)
+        elif Ct != C:
+            tgt = self.target_profiles.mean(dim=0, keepdim=True).expand(C, Nb)
+        else:
+            tgt = self.target_profiles
+        patches = self._unfold(x.float())
+        means = patches.mean(dim=-1)
+        vars_ = self._patch_var(patches)
+        g = self._sobel_mag(x.float())
+        gmean = self._unfold(g).mean(dim=-1)
+        if self.keep_ratio < 1.0:
+            q = torch.quantile(gmean, self.keep_ratio, dim=-1, keepdim=True)
+            mask = gmean <= q
+        else:
+            mask = torch.ones_like(gmean, dtype=torch.bool)
+        means = torch.where(mask, means, torch.full_like(means, -1.0))
+        vars_ = torch.where(mask, vars_, torch.zeros_like(vars_))
+        sum_vars = x.new_zeros(B, C, Nb)
+        counts = x.new_zeros(B, C, Nb)
+        idx = torch.bucketize(means, self.bin_edges, right=True) - 1
+        for b in range(B):
+            for c in range(C):
+                valid = (idx[b, c] >= 0) & (idx[b, c] < Nb) & mask[b, c]
+                if valid.any():
+                    ii = idx[b, c, valid].long()
+                    sum_vars[b, c].index_add_(0, ii, vars_[b, c, valid])
+                    counts[b, c].index_add_(0, ii, torch.ones(ii.numel(), device=x.device, dtype=sum_vars.dtype))
+        hist = sum_vars / (counts + self.eps)
+        bin_mask = counts > 0
+        diff = (hist - tgt.unsqueeze(0)).abs() * bin_mask
+        per_sc = diff.sum(dim=-1) / bin_mask.sum(dim=-1).clamp_min(1.0)
+        loss = per_sc.mean()
+        return loss

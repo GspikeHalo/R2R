@@ -215,7 +215,6 @@ class Solver(nn.Module):
                         mask = (y_ref_all == domain)
                         x_ref_pool = x_ref_all[mask]  # [K,4,H,W]
 
-                        # 尺寸对齐到 B（保留以防 K ≠ B）
                         K = x_ref_pool.size(0)
                         if K < B:
                             idx = torch.randint(low=0, high=K, size=(B,), device=x_ref_pool.device)

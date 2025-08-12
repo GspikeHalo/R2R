@@ -203,34 +203,39 @@ class Solver(nn.Module):
                 print(f"\n=== Iter {step}: sampling fixed val batch ===")
 
                 x_fixed = inputs_val.x_src  # [B,4,H,W]
+                x_ref_all = inputs_val.x_ref  # [B,4,H,W]
+                y_ref_all = inputs_val.y_ref  # [B]
+                B = x_fixed.size(0)
                 imgs_to_log = []
 
                 with torch.no_grad():
                     nets_ema.generator.eval()
                     nets_ema.style_encoder.eval()
                     for domain in range(args.num_domains):
-                        c_t = torch.full(
-                            (x_fixed.size(0),),
-                            domain,
-                            dtype=torch.long,
-                            device=x_fixed.device
-                        )
-                        s_t = nets_ema.style_encoder(x_fixed, c_t)
+                        mask = (y_ref_all == domain)
+                        x_ref_pool = x_ref_all[mask]  # [K,4,H,W]
 
-                        x_fake = nets_ema.generator(x_fixed, s_t)  # [B,4,H,W]
+                        # 尺寸对齐到 B（保留以防 K ≠ B）
+                        K = x_ref_pool.size(0)
+                        if K < B:
+                            idx = torch.randint(low=0, high=K, size=(B,), device=x_ref_pool.device)
+                            x_ref_d = x_ref_pool[idx]
+                        elif K > B:
+                            idx = torch.randperm(K, device=x_ref_pool.device)[:B]
+                            x_ref_d = x_ref_pool[idx]
+                        else:
+                            x_ref_d = x_ref_pool
+
+                        c_t = torch.full((B,), domain, dtype=torch.long, device=x_fixed.device)
+                        s_t = nets_ema.style_encoder(x_ref_d, c_t)
+                        x_fake = nets_ema.generator(x_fixed, s_t)
                         x_fake_den = self.denorm(x_fake)
 
-                        for idx in range(x_fake_den.size(0)):
-                            fake_rgb = self.rggb2rgb(x_fake_den[idx])  # [3,H,W]
+                        for b in range(B):
+                            fake_rgb = self.rggb2rgb(x_fake_den[b])
                             if args.use_wandb:
-                                caption = (
-                                    f"step{step} | "
-                                    f"idx{idx} | "
-                                    f"target_domain{domain}"
-                                )
-                                imgs_to_log.append(
-                                    wandb.Image(fake_rgb, caption=caption)
-                                )
+                                caption = f"step{step} | idx{b} | target_domain{domain}"
+                                imgs_to_log.append(wandb.Image(fake_rgb, caption=caption))
 
                 if args.use_wandb:
                     wandb.log({"val/fixed_samples": imgs_to_log}, step=step)

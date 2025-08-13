@@ -140,6 +140,10 @@ if __name__ == '__main__':
                         help='Decay rate for 2nd moment of Adam')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
                         help='Weight decay for optimizer')
+    parser.add_argument('--cg_anneal_start', type=int, default=30000,
+                        help='')
+    parser.add_argument('--cg_anneal_end', type=int, default=60000,
+                        help='')
 
     # misc
     parser.add_argument('--mode', type=str, required=True,

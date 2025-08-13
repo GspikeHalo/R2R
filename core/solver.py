@@ -131,6 +131,17 @@ class Solver(nn.Module):
 
     def train(self, loaders):
         args = self.args
+
+        cg_start = getattr(args, "cg_anneal_start", None)
+        cg_end = getattr(args, "cg_anneal_end", None)
+
+        def _cg_mix_at(step, start, end):
+            if (start is None) or (end is None) or (end <= start):
+                return 0.0
+            if step <= start: return 0.0
+            if step >= end:   return 1.0
+            return float(step - start) / float(end - start)
+
         nets = self.nets
         nets_ema = self.nets_ema
         optims = self.optims
@@ -152,6 +163,18 @@ class Solver(nn.Module):
         for i in range(args.resume_iter, args.total_iters):
             # fetch images and labels
             inputs = next(fetcher)
+
+            mix = _cg_mix_at(i + 1, cg_start, cg_end)
+            if hasattr(nets.generator, "module") and hasattr(nets.generator.module, "set_cg_mix"):
+                nets.generator.module.set_cg_mix(mix)
+                nets_ema.generator.module.set_cg_mix(mix)  # 保持 EMA 一致
+            else:
+                nets.generator.set_cg_mix(mix)
+                nets_ema.generator.set_cg_mix(mix)
+
+            if args.use_wandb:
+                wandb.log({"cg/mix": mix}, step=i + 1)
+
             x_real, y_org = inputs.x_src, inputs.y_src
             x_ref, x_ref2, y_trg = inputs.x_ref, inputs.x_ref2, inputs.y_ref
 
@@ -207,6 +230,12 @@ class Solver(nn.Module):
                 y_ref_all = inputs_val.y_ref  # [B]
                 B = x_fixed.size(0)
                 imgs_to_log = []
+
+                mix = _cg_mix_at(step, cg_start, cg_end)
+                if hasattr(nets_ema.generator, "module") and hasattr(nets_ema.generator.module, "set_cg_mix"):
+                    nets_ema.generator.module.set_cg_mix(mix)
+                else:
+                    nets_ema.generator.set_cg_mix(mix)
 
                 with torch.no_grad():
                     nets_ema.generator.eval()
@@ -267,6 +296,25 @@ class Solver(nn.Module):
         self._load_checkpoint(step)
         self.generator_ema.eval()
         self.style_encoder_ema.eval()
+
+        cg_start = getattr(self.args, "cg_anneal_start", None)
+        cg_end = getattr(self.args, "cg_anneal_end", None)
+
+        def _cg_mix_at(step, start, end):
+            if (start is None) or (end is None) or (end <= start):
+                return 0.0
+            if step <= start: return 0.0
+            if step >= end:   return 1.0
+            return float(step - start) / float(end - start)
+
+        mix = _cg_mix_at(step, cg_start, cg_end)
+        if getattr(self.args, "best_model", False):
+            mix = 1.0
+
+        if hasattr(self.generator_ema, "module") and hasattr(self.generator_ema.module, "set_cg_mix"):
+            self.generator_ema.module.set_cg_mix(mix)
+        else:
+            self.generator_ema.set_cg_mix(mix)
 
         domains = sorted(os.listdir(self.args.val_img_dir))
         domain2idx = {d: i for i, d in enumerate(domains)}  # {iphone:0}

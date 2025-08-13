@@ -25,15 +25,17 @@ class ChannelGainPerDomain(nn.Module):
         raw_init = torch.log(torch.expm1(torch.tensor(init_gain, dtype=torch.float32)))
         self.raw_weight = nn.Parameter(raw_init.expand(num_domains, 4).clone())  # [D,4]
 
-    def _get_gain(self, d_idx: torch.Tensor):
-        g = F.softplus(self.raw_weight[d_idx]) + self.eps # [B,4]
+    def _get_gain(self, d_idx: torch.Tensor, mix: float = 0.0):
+        g = F.softplus(self.raw_weight[d_idx]) + self.eps  # [B,4]
+        if mix != 0.0:
+            g = g * (1.0 - mix) + 1.0 * mix
         return g.view(-1, 4, 1, 1)
 
-    def forward(self, x, domain):
-        return x * self._get_gain(domain)
+    def forward(self, x, domain, mix: float = 0.0):
+        return x * self._get_gain(domain, mix)
 
-    def inverse(self, x, domain):
-        return x / self._get_gain(domain)
+    def inverse(self, x, domain, mix: float = 0.0):
+        return x / self._get_gain(domain, mix)
 
 class ResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, actv=nn.LeakyReLU(0.2),
@@ -152,6 +154,7 @@ class Generator(nn.Module):
         self.use_chan_gain = use_chan_gain
         if use_chan_gain:
             self.chan_gain = ChannelGainPerDomain(num_domains=num_domains, init_gain=init_gain, eps=eps)
+            self.register_buffer("cg_mix", torch.tensor(0.0))
 
         self.from_raw = nn.Conv2d(4, dim_in, 3, 1, 1)
         self.encode = nn.ModuleList()
@@ -178,9 +181,15 @@ class Generator(nn.Module):
             self.decode.insert(
                 0, AdainResBlk(dim_out, dim_out, style_dim))
 
+    def set_cg_mix(self, v: float):
+        if self.use_chan_gain:
+            self.cg_mix.fill_(float(v))
+
     def forward(self, x, s, y_org=None, c_t=None):
+        mix = float(self.cg_mix) if self.use_chan_gain else 0.0
+
         if self.use_chan_gain and (y_org is not None):
-            x = self.chan_gain.inverse(x, y_org)
+            x = self.chan_gain.inverse(x, y_org, mix=mix)
 
         x = self.from_raw(x)
         skips = []
@@ -197,7 +206,7 @@ class Generator(nn.Module):
         x = self.to_raw(x)
 
         if self.use_chan_gain and (c_t is not None):
-            x = self.chan_gain(x, c_t)
+            x = self.chan_gain(x, c_t, mix=mix)
 
         return x
 

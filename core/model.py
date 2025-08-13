@@ -17,6 +17,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class ChannelGainPerDomain(nn.Module):
+    def __init__(self, num_domains: int, init_gain=1.0, eps=1e-6):
+        super().__init__()
+        self.num_domains = num_domains
+        self.eps = eps
+        raw_init = torch.log(torch.expm1(torch.tensor(init_gain, dtype=torch.float32)))
+        self.raw_weight = nn.Parameter(raw_init.expand(num_domains, 4).clone())  # [D,4]
+
+    def _get_gain(self, d_idx: torch.Tensor):
+        g = F.softplus(self.raw_weight[d_idx]) + self.eps # [B,4]
+        return g.view(-1, 4, 1, 1)
+
+    def forward(self, x, domain):
+        return x * self._get_gain(domain)
+
+    def inverse(self, x, domain):
+        return x / self._get_gain(domain)
+
 class ResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, actv=nn.LeakyReLU(0.2),
                  normalize=False, downsample=False):
@@ -127,10 +145,14 @@ class AdainResBlk(nn.Module):
         return (res + skip) / math.sqrt(2)
 
 class Generator(nn.Module):
-    def __init__(self, img_size=256, style_dim=64, max_conv_dim=512):
+    def __init__(self, img_size=256, style_dim=64, max_conv_dim=512, num_domains=2, use_chan_gain=True, init_gain=1.0, eps=1e-6):
         super().__init__()
         dim_in = 2**14 // img_size
         self.img_size = img_size
+        self.use_chan_gain = use_chan_gain
+        if use_chan_gain:
+            self.chan_gain = ChannelGainPerDomain(num_domains=num_domains, init_gain=init_gain, eps=eps)
+
         self.from_raw = nn.Conv2d(4, dim_in, 3, 1, 1)
         self.encode = nn.ModuleList()
         self.decode = nn.ModuleList()
@@ -156,7 +178,10 @@ class Generator(nn.Module):
             self.decode.insert(
                 0, AdainResBlk(dim_out, dim_out, style_dim))
 
-    def forward(self, x, s):
+    def forward(self, x, s, y_org=None, c_t=None):
+        if self.use_chan_gain and (y_org is not None):
+            x = self.chan_gain.inverse(x, y_org)
+
         x = self.from_raw(x)
         skips = []
         for block in self.encode:
@@ -169,7 +194,12 @@ class Generator(nn.Module):
             if skip.shape[2:] != x.shape[2:]:
                 skip = F.interpolate(skip, size=x.shape[2:], mode='bicubic', align_corners=False)
             x = x + skip
-        return self.to_raw(x)
+        x = self.to_raw(x)
+
+        if self.use_chan_gain and (c_t is not None):
+            x = self.chan_gain(x, c_t)
+
+        return x
 
 class StyleEncoder(nn.Module):
     def __init__(self, img_size=256, style_dim=64, num_domains=2, max_conv_dim=512):
@@ -233,7 +263,7 @@ class Discriminator(nn.Module):
 
 
 def build_model(args):
-    generator = nn.DataParallel(Generator(args.img_size, args.style_dim))
+    generator = nn.DataParallel(Generator(args.img_size, args.style_dim, num_domains=args.num_domains))
     style_encoder = nn.DataParallel(StyleEncoder(args.img_size, args.style_dim, args.num_domains))
     discriminator = nn.DataParallel(Discriminator(args.img_size, args.num_domains))
     generator_ema = copy.deepcopy(generator)

@@ -227,7 +227,7 @@ class Solver(nn.Module):
 
                         c_t = torch.full((B,), domain, dtype=torch.long, device=x_fixed.device)
                         s_t = nets_ema.style_encoder(x_ref_d, c_t)
-                        x_fake = nets_ema.generator(x_fixed, s_t)
+                        x_fake = nets_ema.generator(x_fixed, s_t, y_org=inputs_val.y_src, c_t=c_t)
                         x_fake_den = self.denorm(x_fake)
 
                         for b in range(B):
@@ -296,11 +296,11 @@ class Solver(nn.Module):
                 x_src = imgs_dict[src]
                 x_tgt = imgs_dict[tgt]
 
-                y_tgt = torch.full((B,), domain2idx[tgt],
-                                   device=self.device, dtype=torch.long)
+                y_tgt = torch.full((B,), domain2idx[tgt], device=self.device, dtype=torch.long)
+                y_src = torch.full((B,), domain2idx[src], device=self.device, dtype=torch.long)
 
                 s_t = self.style_encoder_ema(x_tgt, y_tgt)
-                x_fake = self.generator_ema(x_src, s_t)
+                x_fake = self.generator_ema(x_src, s_t, y_org=y_src, c_t=y_tgt)
                 x_fake_den = self.denorm(x_fake)
                 x_tgt_den = self.denorm(x_tgt)
 
@@ -374,7 +374,7 @@ def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref):
 
     with torch.no_grad():
         s_trg = nets.style_encoder(x_ref, y_trg)
-        x_fake = nets.generator(x_real, s_trg)
+        x_fake = nets.generator(x_real, s_trg, y_org=y_org, c_t=y_trg)
     out = nets.discriminator(x_fake, y_trg)
     loss_fake = adv_loss(out, 0)
 
@@ -388,7 +388,7 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None,
 
     # adversarial loss
     s_trg = nets.style_encoder(x_ref, y_trg)
-    x_fake = nets.generator(x_real, s_trg)
+    x_fake = nets.generator(x_real, s_trg, y_org=y_org, c_t=y_trg)
     out = nets.discriminator(x_fake, y_trg)
     loss_adv = adv_loss(out, 1)
 
@@ -398,13 +398,13 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None,
 
     # diversity sensitive loss
     s_trg2 = nets.style_encoder(x_ref2, y_trg)
-    x_fake2 = nets.generator(x_real, s_trg2)
+    x_fake2 = nets.generator(x_real, s_trg2, y_org=y_org, c_t=y_trg)
     x_fake2 = x_fake2.detach()
     loss_ds = torch.mean(torch.abs(x_fake - x_fake2))
 
     # cycle-consistency loss
     s_org = nets.style_encoder(x_real, y_org)
-    x_rec = nets.generator(x_fake, s_org)
+    x_rec = nets.generator(x_fake, s_org, y_org=y_trg, c_t=y_org)
     loss_cyc = torch.mean(torch.abs(x_rec - x_real))
     loss_noise = x_real.new_zeros([])
     if (noise_loss_fn is not None) and (lambda_noise > 0):

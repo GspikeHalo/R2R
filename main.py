@@ -53,7 +53,7 @@ def main(args):
             project='StarGAN-R2R',
             entity='bias-lab',
             config=vars(args),
-            name="raw2raw-base"
+            name="raw2raw-multi-kernel"
         )
 
     solver = Solver(args)
@@ -159,13 +159,13 @@ if __name__ == '__main__':
                         help='Directory containing validation images')
     parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
                         help='Directory for saving generated images')
-    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-base/expr/checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-multi-kernel/expr/checkpoints',
                         help='Directory for saving network checkpoints')
     parser.add_argument('--noise_profile_paths', type=str,
                         default='./preprocess/noise_profiles/iphone_profile.pt,./preprocess/noise_profiles/samsung_profile.pt')
 
     # directory for testing
-    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-base/expr/results',
+    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-multi-kernel/expr/results',
                         help='Directory for saving generated images and videos')
 
     # step size

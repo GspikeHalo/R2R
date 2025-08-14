@@ -35,6 +35,51 @@ class ChannelGainPerDomain(nn.Module):
     def inverse(self, x, domain):
         return x / self._get_gain(domain)
 
+class SpatialKernelGateCond(nn.Module):
+    def __init__(self, channels: int, style_dim: int, k = 7, dilations=None):
+        super().__init__()
+        assert k % 2 == 1, "k must be odd to keep size"
+        pad = k // 2
+
+        self.multi = dilations is not None
+        if not self.multi:
+            self.dw = nn.Conv2d(channels, channels, k, padding=pad,
+                                groups=channels, bias=False)
+            self.fuse = nn.Identity()
+        else:
+            self.branches = nn.ModuleList([
+                nn.Conv2d(channels, channels, k,
+                          padding=d*(k//2), dilation=d,
+                          groups=channels, bias=False)
+                for d in dilations
+            ])
+            self.fuse = nn.Conv2d(channels*len(dilations), channels, 1, bias=True)
+
+        self.style_fc = nn.Sequential(
+            nn.Linear(style_dim, channels),
+            nn.SiLU(),
+            nn.Linear(channels, channels)
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) and m.groups == channels:
+                nn.init.kaiming_normal_(m.weight, nonlinearity='linear')
+        nn.init.zeros_(self.style_fc[-1].weight)
+        nn.init.zeros_(self.style_fc[-1].bias)
+
+        self.att_scale = 1.0
+
+    def forward(self, x, s):
+        if self.multi:
+            h = torch.cat([b(x) for b in self.branches], dim=1)
+            att_sp = torch.sigmoid(self.fuse(h))          # [B,C,H,W]
+        else:
+            att_sp = torch.sigmoid(self.dw(x))            # [B,C,H,W]
+
+        att_ch = torch.sigmoid(self.style_fc(s)).view(s.size(0), -1, 1, 1)  # [B,C,1,1]
+        att = att_sp * att_ch
+        return x * (1.0 + self.att_scale * att)
+
 class ResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, actv=nn.LeakyReLU(0.2),
                  normalize=False, downsample=False):
@@ -94,7 +139,7 @@ class AdaIN(nn.Module):
 
 class AdainResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, style_dim=64,
-                 actv=nn.LeakyReLU(0.2), upsample=False):
+                 actv=nn.LeakyReLU(0.2), upsample=False, use_spa_gate = True, spa_k=7, spa_multi=True):
         super().__init__()
         self.actv = actv
         self.upsample = upsample
@@ -103,6 +148,13 @@ class AdainResBlk(nn.Module):
 
         self.noise_weight1 = nn.Parameter(torch.zeros(dim_out))
         self.noise_weight2 = nn.Parameter(torch.zeros(dim_out))
+
+        self.use_spa_gate = use_spa_gate
+        if use_spa_gate:
+            if spa_multi:
+                self.spa_gate = SpatialKernelGateCond(dim_out, style_dim, k=spa_k, dilations=(1,4,9))
+            else:
+                self.spa_gate = SpatialKernelGateCond(dim_out, style_dim, k=spa_k, dilations=None)
 
     def _build_weights(self, dim_in, dim_out, style_dim=64):
         self.conv1 = nn.Conv2d(dim_in, dim_out, 3, 1, 1)
@@ -136,6 +188,9 @@ class AdainResBlk(nn.Module):
 
         noise2 = torch.randn(b, 1, x.shape[2], x.shape[3], device=x.device)
         x = x + noise2 * self.noise_weight2.view(1, -1, 1, 1)
+
+        if self.use_spa_gate:
+            x = self.spa_gate(x, s)
 
         return x
 

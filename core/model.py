@@ -186,11 +186,11 @@ class AdainResBlk(nn.Module):
         x = self.actv(x)
         x = self.conv2(x)
 
-        noise2 = torch.randn(b, 1, x.shape[2], x.shape[3], device=x.device)
-        x = x + noise2 * self.noise_weight2.view(1, -1, 1, 1)
-
         if self.use_spa_gate:
             x = self.spa_gate(x, s)
+
+        noise2 = torch.randn(b, 1, x.shape[2], x.shape[3], device=x.device)
+        x = x + noise2 * self.noise_weight2.view(1, -1, 1, 1)
 
         return x
 

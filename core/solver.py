@@ -200,43 +200,51 @@ class Solver(nn.Module):
             if (i+1) % args.sample_every == 0:
                 step = i+1
                 os.makedirs(args.sample_dir, exist_ok=True)
-                print(f"\n=== Iter {step}: sampling fixed val batch ===")
+                print(f"\n=== Iter {step}: sampling ALL fixed val images ===")
 
-                x_fixed = inputs_val.x_src  # [B,4,H,W]
-                x_ref_all = inputs_val.x_ref  # [B,4,H,W]
-                y_ref_all = inputs_val.y_ref  # [B]
-                B = x_fixed.size(0)
                 imgs_to_log = []
 
                 with torch.no_grad():
                     nets_ema.generator.eval()
                     nets_ema.style_encoder.eval()
-                    for domain in range(args.num_domains):
-                        mask = (y_ref_all == domain)
-                        x_ref_pool = x_ref_all[mask]  # [K,4,H,W]
 
-                        K = x_ref_pool.size(0)
-                        if K < B:
-                            idx = torch.randint(low=0, high=K, size=(B,), device=x_ref_pool.device)
-                            x_ref_d = x_ref_pool[idx]
-                        elif K > B:
-                            idx = torch.randperm(K, device=x_ref_pool.device)[:B]
-                            x_ref_d = x_ref_pool[idx]
-                        else:
-                            x_ref_d = x_ref_pool
+                    sample_fetcher = InputFetcher(loaders.val, loaders.ref, 'train')
 
-                        c_t = torch.full((B,), domain, dtype=torch.long, device=x_fixed.device)
-                        s_t = nets_ema.style_encoder(x_ref_d, c_t)
-                        x_fake = nets_ema.generator(x_fixed, s_t, y_org=inputs_val.y_src, c_t=c_t)
-                        x_fake_den = self.denorm(x_fake)
+                    for _ in range(len(loaders.val)):
+                        batch = next(sample_fetcher)
+                        x_fixed = batch.x_src.to(self.device)  # [B,4,H,W]
+                        x_ref_all = batch.x_ref.to(self.device)  # [B,4,H,W]
+                        y_ref_all = batch.y_ref.to(self.device)  # [B]
+                        B = x_fixed.size(0)
 
-                        for b in range(B):
-                            fake_rgb = self.rggb2rgb(x_fake_den[b])
+                        for domain in range(args.num_domains):
+                            mask = (y_ref_all == domain)
+                            if mask.sum() == 0:
+                                continue
+                            x_ref_pool = x_ref_all[mask]
+                            K = x_ref_pool.size(0)
+
+                            if K < B:
+                                idx = torch.randint(low=0, high=K, size=(B,), device=x_ref_pool.device)
+                                x_ref_d = x_ref_pool[idx]
+                            elif K > B:
+                                idx = torch.randperm(K, device=x_ref_pool.device)[:B]
+                                x_ref_d = x_ref_pool[idx]
+                            else:
+                                x_ref_d = x_ref_pool
+
+                            c_t = torch.full((B,), domain, dtype=torch.long, device=x_fixed.device)
+                            s_t = nets_ema.style_encoder(x_ref_d, c_t)
+                            x_fake = nets_ema.generator(x_fixed, s_t)
+                            x_fake_den = self.denorm(x_fake)
+
                             if args.use_wandb:
-                                caption = f"step{step} | idx{b} | target_domain{domain}"
-                                imgs_to_log.append(wandb.Image(fake_rgb, caption=caption))
+                                for b in range(B):
+                                    fake_rgb = self.rggb2rgb(x_fake_den[b])
+                                    caption = f"step{step} | batch_idx{b} | target_domain{domain}"
+                                    imgs_to_log.append(wandb.Image(fake_rgb, caption=caption))
 
-                if args.use_wandb:
+                if args.use_wandb and imgs_to_log:
                     wandb.log({"val/fixed_samples": imgs_to_log}, step=step)
 
             # save model checkpoints

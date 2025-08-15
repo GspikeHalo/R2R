@@ -158,18 +158,25 @@ def get_train_loader(root, which='source', img_size=256,
     print('Preparing DataLoader to fetch %s images '
           'during the training phase...' % which)
 
-    crop = transforms.RandomResizedCrop(
-        img_size, scale=[0.8, 1.0], ratio=[0.9, 1.1])
-    rand_crop = transforms.Lambda(
-        lambda x: crop(x) if random.random() < prob else x)
+    if (which == 'source') and (fixed_filenames is not None):
+        transform = transforms.Compose([
+            transforms.Resize([img_size, img_size]),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
+                                 std =[0.5, 0.5, 0.5, 0.5]),
+        ])
+    else:
+        crop = transforms.RandomResizedCrop(
+            img_size, scale=[0.8, 1.0], ratio=[0.9, 1.1])
+        rand_crop = transforms.Lambda(
+            lambda x: crop(x) if random.random() < prob else x)
 
-    transform = transforms.Compose([
-        rand_crop,
-        transforms.Resize([img_size, img_size]),
-        transforms.RandomHorizontalFlip(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
-                             std=[0.5, 0.5, 0.5, 0.5]),
-    ])
+        transform = transforms.Compose([
+            rand_crop,
+            transforms.Resize([img_size, img_size]),
+            transforms.RandomHorizontalFlip(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
+                                 std=[0.5, 0.5, 0.5, 0.5]),
+        ])
 
     if which == 'source':
         dataset = NpyFolder(root, transform, fixed_filenames)
@@ -178,13 +185,21 @@ def get_train_loader(root, which='source', img_size=256,
     else:
         raise NotImplementedError
 
-    sampler = _make_balanced_sampler(dataset.targets)
-    return data.DataLoader(dataset=dataset,
-                           batch_size=batch_size,
-                           sampler=sampler,
-                           num_workers=num_workers,
-                           pin_memory=True,
-                           drop_last=True)
+    if (which == 'source') and (fixed_filenames is not None):
+        return data.DataLoader(dataset=dataset,
+                               batch_size=batch_size,
+                               shuffle=False,
+                               num_workers=num_workers,
+                               pin_memory=True,
+                               drop_last=True)
+    else:
+        sampler = _make_balanced_sampler(dataset.targets)
+        return data.DataLoader(dataset=dataset,
+                               batch_size=batch_size,
+                               sampler=sampler,
+                               num_workers=num_workers,
+                               pin_memory=True,
+                               drop_last=True)
 
 def get_test_loader(root, domains, img_size=256, batch_size=32,
                     shuffle=False, num_workers=4):

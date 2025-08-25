@@ -146,9 +146,6 @@ class AdainResBlk(nn.Module):
         self.learned_sc = dim_in != dim_out
         self._build_weights(dim_in, dim_out, style_dim)
 
-        self.noise_weight1 = nn.Parameter(torch.zeros(dim_out))
-        self.noise_weight2 = nn.Parameter(torch.zeros(dim_out))
-
         self.use_spa_gate = use_spa_gate
         if use_spa_gate:
             if spa_multi:
@@ -178,19 +175,12 @@ class AdainResBlk(nn.Module):
             x = F.interpolate(x, scale_factor=2, mode='bicubic', align_corners=False)
         x = self.conv1(x)
 
-        b, c, h, w = x.shape
-        noise1 = torch.randn(b, 1, h, w, device=x.device)
-        x = x + noise1 * self.noise_weight1.view(1, -1, 1, 1)
-
         x = self.norm2(x, s)
         x = self.actv(x)
         x = self.conv2(x)
 
         if self.use_spa_gate:
             x = self.spa_gate(x, s)
-
-        noise2 = torch.randn(b, 1, x.shape[2], x.shape[3], device=x.device)
-        x = x + noise2 * self.noise_weight2.view(1, -1, 1, 1)
 
         return x
 

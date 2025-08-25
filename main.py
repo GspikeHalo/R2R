@@ -22,11 +22,16 @@ from pathlib import Path
 import wandb
 
 FIXINPUT={
-    'iphone-x': ['3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy',
-                 '2797.npy', '5890.npy', '3316.npy', '3053.npy', '279.npy',  '588.npy',  '3055.npy', '3310.npy'],
-    'samsung-s9': [ '3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy',
-                    '2797.npy', '5890.npy', '3316.npy', '3053.npy', '279.npy',  '588.npy',  '3055.npy', '3310.npy',]
+    'iphone-x': ['3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy'],
+    'samsung-s9': [ '3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy']
 }
+
+# FIXINPUT={
+#     'iphone-x': ['3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy',
+#                  '2797.npy', '5890.npy', '3316.npy', '3053.npy', '279.npy',  '588.npy',  '3055.npy', '3310.npy'],
+#     'samsung-s9': [ '3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy',
+#                     '2797.npy', '5890.npy', '3316.npy', '3053.npy', '279.npy',  '588.npy',  '3055.npy', '3310.npy',]
+# }
 
 def str2bool(v):
     return v.lower() in ('true')
@@ -53,7 +58,7 @@ def main(args):
             project='StarGAN-R2R',
             entity='bias-lab',
             config=vars(args),
-            name="raw2raw-multi-kernel"
+            name="raw2raw-multi-kernel-without-random-noise"
         )
 
     solver = Solver(args)
@@ -159,13 +164,13 @@ if __name__ == '__main__':
                         help='Directory containing validation images')
     parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
                         help='Directory for saving generated images')
-    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-multi-kernel/expr/checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-multi-kernel-3/expr/checkpoints',
                         help='Directory for saving network checkpoints')
     parser.add_argument('--noise_profile_paths', type=str,
                         default='./preprocess/noise_profiles/iphone_profile.pt,./preprocess/noise_profiles/samsung_profile.pt')
 
     # directory for testing
-    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-multi-kernel/expr/results',
+    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-multi-kernel-3/expr/results',
                         help='Directory for saving generated images and videos')
 
     # step size

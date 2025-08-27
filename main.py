@@ -123,6 +123,8 @@ if __name__ == '__main__':
                         help='Weight for diversity sensitive loss')
     parser.add_argument('--lambda_noise', type=float, default=1.0,
                         help='Weight for noise consistency loss')
+    parser.add_argument('--lambda_id', type=float, default=1.0,
+                        help='Weight for id identity loss')
     parser.add_argument('--ds_iter', type=int, default=100000,
                         help='Number of iterations to optimize diversity sensitive loss')
 

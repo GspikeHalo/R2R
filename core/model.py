@@ -17,6 +17,85 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class FBMFourierFeature(nn.Module):
+    def __init__(self, channels, style_dim, thresholds = (0.0, 1/16, 1/8, 1/4, 1/2), use_chebyshev=True, att_scale=1.0):
+        super().__init__()
+        self.channels = channels
+        self.register_buffer('thresholds', torch.tensor(thresholds, dtype=torch.float32), persistent=False)
+        self.use_chebyshev = use_chebyshev
+        self.att_scale = att_scale
+        self.num_bands = len(thresholds) - 1
+
+        self.spa_head = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, 1, 1),
+            nn.SiLU(),
+            nn.Conv2d(channels, self.num_bands, 1, 1, 0)
+        )
+
+        self.glo_head = nn.Sequential(
+            nn.Linear(style_dim, 128),
+            nn.SiLU(),
+            nn.Linear(128, self.num_bands)
+        )
+
+        nn.init.zeros_(self.spa_head[-1].weight); nn.init.zeros_(self.spa_head[-1].bias)
+        nn.init.zeros_(self.glo_head[-1].weight); nn.init.zeros_(self.glo_head[-1].bias)
+        self.spa_head[-1].skip_he_init = True
+        self.glo_head[-1].skip_he_init = True
+        self._mask_cache = {}
+
+    @torch.no_grad()
+    def _get_band_masks(self, H, W, device):
+        key = (H, W, device)
+        if key in self._mask_cache:
+            return self._mask_cache[key]
+
+        u = torch.fft.fftfreq(H, d=1.0, device=device)
+        v = torch.fft.fftfreq(W, d=1.0, device=device)
+        u = torch.fft.fftshift(u)
+        v = torch.fft.fftshift(v)
+
+        UU, VV = torch.meshgrid(u, v, indexing='ij')
+        if self.use_chebyshev:
+            R = torch.maximum(UU.abs(), VV.abs())
+        else:
+            R = torch.sqrt(UU * UU + VV * VV)
+
+        th = self.thresholds.to(device=device, dtype=R.dtype)
+        masks = []
+        for b in range(self.num_bands):
+            mb = ((R >= th[b]) & (R < th[b + 1])).to(R.dtype)
+            masks.append(mb)
+        M = torch.stack(masks, dim=0)
+        self._mask_cache[key] = M
+        return M
+
+    def forward(self, x, s):
+        B, C, H, W = x.shape
+        assert C == self.channels
+
+        Fx = torch.fft.fft2(x, dim=(-2, -1))
+        Fx_shift = torch.fft.fftshift(Fx, dim=(-2, -1))
+
+        M = self._get_band_masks(H, W, x.device)
+        x_b_list = []
+        for b in range(self.num_bands):
+            Mb = M[b].view(1, 1, H, W)  # [1,1,H,W]
+            Fxb_shift = Fx_shift * Mb
+            Fxb = torch.fft.ifftshift(Fxb_shift, dim=(-2, -1))
+            Xb = torch.fft.ifft2(Fxb, dim=(-2, -1)).real
+            x_b_list.append(Xb)  # [B,C,H,W]
+
+        Xb_stack = torch.stack(x_b_list, dim=1)  # [B,BANDS,C,H,W]
+
+        A_spa = torch.sigmoid(self.spa_head(x))  # [B,BANDS,H,W]
+        A_glo = torch.sigmoid(self.glo_head(s)).view(B, self.num_bands, 1, 1)  # [B,BANDS,1,1]
+        A = A_spa * A_glo  # [B,BANDS,H,W]
+        A = 1.0 + self.att_scale * (A - 0.5)  # ~ [0.5,1.5]
+
+        x_fbm = (Xb_stack * A.unsqueeze(2)).sum(dim=1)  # [B,C,H,W]
+        return x_fbm
+
 class ChannelGainPerDomain(nn.Module):
     def __init__(self, num_domains: int, init_gain=1.0, eps=1e-6):
         super().__init__()
@@ -66,6 +145,7 @@ class SpatialKernelGateCond(nn.Module):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='linear')
         nn.init.zeros_(self.style_fc[-1].weight)
         nn.init.zeros_(self.style_fc[-1].bias)
+        self.style_fc[-1].skip_he_init = True
 
         self.att_scale = 1.0
 
@@ -139,12 +219,20 @@ class AdaIN(nn.Module):
 
 class AdainResBlk(nn.Module):
     def __init__(self, dim_in, dim_out, style_dim=64,
-                 actv=nn.LeakyReLU(0.2), upsample=False, use_spa_gate = True, spa_k=7, spa_multi=True):
+                 actv=nn.LeakyReLU(0.2), upsample=False, use_spa_gate = True, spa_k=7, spa_multi=True, use_fbm=True):
         super().__init__()
         self.actv = actv
         self.upsample = upsample
         self.learned_sc = dim_in != dim_out
         self._build_weights(dim_in, dim_out, style_dim)
+
+        # self.noise_weight1 = nn.Parameter(torch.zeros(dim_out))
+        # self.noise_weight2 = nn.Parameter(torch.zeros(dim_out))
+
+        self.use_fbm = use_fbm
+        if use_fbm: self.fbm_fourier = FBMFourierFeature(dim_out, style_dim,
+                                                 thresholds=(0.0, 1 / 16, 1 / 8, 1 / 4, 1 / 2),
+                                                 use_chebyshev=True, att_scale=1.0)
 
         self.use_spa_gate = use_spa_gate
         if use_spa_gate:
@@ -175,12 +263,24 @@ class AdainResBlk(nn.Module):
             x = F.interpolate(x, scale_factor=2, mode='bicubic', align_corners=False)
         x = self.conv1(x)
 
+        # if self.training:
+        #     b, c, h, w = x.shape
+        #     noise1 = torch.randn(b, 1, h, w, device=x.device)
+        #     x = x + noise1 * self.noise_weight1.view(1, -1, 1, 1)
+
         x = self.norm2(x, s)
         x = self.actv(x)
+
+        if self.use_fbm:
+            x = self.fbm_fourier(x, s)
         x = self.conv2(x)
 
         if self.use_spa_gate:
             x = self.spa_gate(x, s)
+        # if self.training:
+        #     b, c, h, w = x.shape
+        #     noise2 = torch.randn(b, 1, h, w, device=x.device, dtype=x.dtype)
+        #     x = x + noise2 * self.noise_weight2.view(1, -1, 1, 1)
 
         return x
 

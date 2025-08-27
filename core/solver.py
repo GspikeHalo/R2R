@@ -163,8 +163,7 @@ class Solver(nn.Module):
 
             g_loss, g_losses_ref = compute_g_loss(
                 nets, args, x_real, y_org, y_trg, x_refs=[x_ref, x_ref2],
-                noise_loss_fn=self._noise_loss_batch,
-                lambda_noise=args.lambda_noise
+                noise_loss_fn=self._noise_loss_batch
             )
             self._reset_grad()
             g_loss.backward()
@@ -391,7 +390,7 @@ def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref):
                        fake=loss_fake.item(),
                        reg=loss_reg.item())
 
-def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None, lambda_noise=0.0):
+def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None):
     x_ref, x_ref2 = x_refs
 
     # adversarial loss
@@ -414,11 +413,33 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None,
     s_org = nets.style_encoder(x_real, y_org)
     x_rec = nets.generator(x_fake, s_org, y_org=y_trg, c_t=y_org)
     loss_cyc = torch.mean(torch.abs(x_rec - x_real))
+
+    lambda_id = getattr(args, 'lambda_id', 0.0)
+    if lambda_id > 0:
+        x_id = nets.generator(x_real, s_org, y_org=y_org, c_t=y_org)
+        loss_id = torch.mean(torch.abs(x_id - x_real))
+    else:
+        loss_id = x_real.new_zeros([])
+
     loss_noise = x_real.new_zeros([])
-    if (noise_loss_fn is not None) and (lambda_noise > 0):
+    if (noise_loss_fn is not None) and (getattr(args, 'lambda_noise', 0.0) > 0):
         loss_noise = noise_loss_fn(x_fake, y_trg)
-    loss = loss_adv + args.lambda_sty * loss_sty - args.lambda_ds * loss_ds + args.lambda_cyc * loss_cyc + lambda_noise * loss_noise
-    return loss, Munch(adv=loss_adv.item(), sty=loss_sty.item(), ds=loss_ds.item(), cyc=loss_cyc.item(), noise=loss_noise.item())
+
+    loss = (loss_adv
+            + args.lambda_sty * loss_sty
+            - args.lambda_ds * loss_ds
+            + args.lambda_cyc * loss_cyc
+            + getattr(args, 'lambda_noise', 0.0) * loss_noise
+            + lambda_id * loss_id)
+
+    return loss, Munch(
+        adv=loss_adv.item(),
+        sty=loss_sty.item(),
+        ds=loss_ds.item(),
+        cyc=loss_cyc.item(),
+        noise=loss_noise.item(),
+        id=loss_id.item()
+    )
 
 def moving_average(model, model_test, beta=0.999):
     for param, param_test in zip(model.parameters(), model_test.parameters()):

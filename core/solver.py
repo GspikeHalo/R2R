@@ -28,6 +28,26 @@ from torchvision.utils import save_image
 
 import wandb
 
+class ProgressiveScheduler:
+    def __init__(self, stages, iters_per_stage, fade_ratio=0.3, base_res=256):
+        assert len(stages) >= 1
+        self.stages = stages
+        self.iters_per_stage = iters_per_stage
+        self.fade_iters = int(iters_per_stage * float(fade_ratio))
+        self.base_res = base_res
+
+    def query(self, global_step: int):
+        stage_idx = min(global_step // self.iters_per_stage, len(self.stages)-1)
+        cur_res = self.stages[stage_idx]
+        inner = global_step - stage_idx * self.iters_per_stage
+        if self.fade_iters > 0:
+            alpha = min(1.0, max(0.0, inner / self.fade_iters))
+        else:
+            alpha = 1.0
+        # R1 惩罚缩放（使其随分辨率成平方缩放，保持量级相近）
+        r1_scale = (float(cur_res) / float(self.base_res)) ** 2
+        return cur_res, alpha, r1_scale
+
 class Solver(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -78,6 +98,20 @@ class Solver(nn.Module):
             ]
 
             self.best_mae = float('inf')
+
+            prog_stages = getattr(args, 'prog_res_stages', [max(64, args.img_size // 2), args.img_size])
+            iters_per_stage = getattr(args, 'iters_per_stage', 10000)
+            fade_ratio = getattr(args, 'fade_ratio', 0.3)
+            self._prog = ProgressiveScheduler(
+                stages=prog_stages,
+                iters_per_stage=iters_per_stage,
+                fade_ratio=fade_ratio,
+                base_res=args.img_size
+            )
+
+            # 可选：R1 基础权重（最终分辨率的基准），沿用你现有 lambda_reg 语义
+            self._r1_base_lambda = getattr(args, 'lambda_reg', 10.0)
+
         else:
             if self.args.best_model:
                 ema_template = os.path.join(self.args.checkpoint_dir, 'best_nets_ema.ckpt')
@@ -92,6 +126,25 @@ class Solver(nn.Module):
             if 'ema' not in name:
                 print('Initializing %s...' % name)
                 network.apply(utils.he_init)
+
+    @staticmethod
+    def _resize_bicubic(x, size_hw):
+        return F.interpolate(x, size=size_hw, mode='bicubic', align_corners=False)
+
+    def _downup256(self, x, cur_res):
+        target = self.args.img_size
+        if cur_res >= target:
+            return x
+        x_down = self._resize_bicubic(x, (cur_res, cur_res))
+        x_up   = self._resize_bicubic(x_down, (target, target))
+        return x_up
+
+    def _fade_mix256(self, x, alpha, cur_res):
+        """fade-in 混合： (1-α)*低频版 + α*原图；输出尺寸与输入相同（目标分辨率）。"""
+        if alpha >= 1.0 or cur_res >= self.args.img_size:
+            return x
+        low = self._downup256(x, cur_res)
+        return (1.0 - alpha) * low + alpha * x
 
     def _save_checkpoint(self, step):
         for ckptio in self.ckptios:
@@ -150,20 +203,26 @@ class Solver(nn.Module):
         print('Start training...')
         start_time = time.time()
         for i in range(args.resume_iter, args.total_iters):
+            cur_res, alpha, r1_scale = self._prog.query(i)
+
             # fetch images and labels
             inputs = next(fetcher)
             x_real, y_org = inputs.x_src, inputs.y_src
             x_ref, x_ref2, y_trg = inputs.x_ref, inputs.x_ref2, inputs.y_ref
 
             d_loss, d_losses_ref = compute_d_loss(
-                nets, args, x_real, y_org, y_trg, x_ref=x_ref)
+                nets, args, x_real, y_org, y_trg, x_ref=x_ref,
+                fade_fn=lambda x: self._fade_mix256(x, alpha, cur_res),
+                r1_lambda_eff=self._r1_base_lambda * r1_scale
+            )
             self._reset_grad()
             d_loss.backward()
             optims.discriminator.step()
 
             g_loss, g_losses_ref = compute_g_loss(
                 nets, args, x_real, y_org, y_trg, x_refs=[x_ref, x_ref2],
-                noise_loss_fn=self._noise_loss_batch
+                noise_loss_fn=self._noise_loss_batch,
+                fade_fn=lambda x: self._fade_mix256(x, alpha, cur_res)
             )
             self._reset_grad()
             g_loss.backward()
@@ -189,6 +248,9 @@ class Solver(nn.Module):
                     for key, value in loss.items():
                         all_losses[prefix + key] = value
                 all_losses['G/lambda_ds'] = args.lambda_ds
+                all_losses['prog/cur_res'] = float(cur_res)
+                all_losses['prog/alpha'] = float(alpha)
+                all_losses['prog/r1_scale'] = float(r1_scale)
                 log += ' '.join(['%s: [%.4f]' % (key, value) for key, value in all_losses.items()])
                 print(log)
 
@@ -255,7 +317,7 @@ class Solver(nn.Module):
                 self._save_checkpoint(step=step)
                 print(f"⇒ Saved checkpoint for iter {step}, old step files have been removed.")
 
-            # # compute FID and LPIPS if necessary
+            # compute eval metrics if necessary（保持与原来一致）
             if (i+1) % args.eval_every == 0:
                 print(f"\n===Iter {i+1}: running test() ===")
                 current_mae = self.test(step=i+1)
@@ -371,32 +433,39 @@ class Solver(nn.Module):
 
         return avg_mae
 
-def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref):
+
+def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref,
+                   fade_fn=None, r1_lambda_eff=None):
     assert x_ref is not None
 
-    x_real.requires_grad_()
-    out = nets.discriminator(x_real, y_org)
+    x_real_in = fade_fn(x_real) if fade_fn is not None else x_real
+    x_real_in.requires_grad_()
+    out = nets.discriminator(x_real_in, y_org)
     loss_real = adv_loss(out, 1)
-    loss_reg = r1_reg(out, x_real)
+    loss_reg = r1_reg(out, x_real_in)
 
     with torch.no_grad():
         s_trg = nets.style_encoder(x_ref, y_trg)
         x_fake = nets.generator(x_real, s_trg, y_org=y_org, c_t=y_trg)
-    out = nets.discriminator(x_fake, y_trg)
+        x_fake_in = fade_fn(x_fake) if fade_fn is not None else x_fake
+
+    out = nets.discriminator(x_fake_in, y_trg)
     loss_fake = adv_loss(out, 0)
 
-    loss = loss_real + loss_fake + args.lambda_reg * loss_reg
+    lambda_reg = args.lambda_reg if (r1_lambda_eff is None) else float(r1_lambda_eff)
+    loss = loss_real + loss_fake + lambda_reg * loss_reg
     return loss, Munch(real=loss_real.item(),
                        fake=loss_fake.item(),
                        reg=loss_reg.item())
 
-def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None):
+def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None, fade_fn=None):
     x_ref, x_ref2 = x_refs
 
     # adversarial loss
     s_trg = nets.style_encoder(x_ref, y_trg)
     x_fake = nets.generator(x_real, s_trg, y_org=y_org, c_t=y_trg)
-    out = nets.discriminator(x_fake, y_trg)
+    x_fake_in = fade_fn(x_fake) if fade_fn is not None else x_fake
+    out = nets.discriminator(x_fake_in, y_trg)
     loss_adv = adv_loss(out, 1)
 
     # style reconstruction loss

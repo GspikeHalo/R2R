@@ -64,9 +64,12 @@ class FBMFourierFeature(nn.Module):
         th = self.thresholds.to(device=device, dtype=R.dtype)
         masks = []
         for b in range(self.num_bands):
-            mb = ((R >= th[b]) & (R < th[b + 1])).to(R.dtype)
-            masks.append(mb)
-        M = torch.stack(masks, dim=0)
+            if b < self.num_bands - 1:
+                mb = ((R >= th[b]) & (R < th[b + 1]))
+            else:
+                mb = ((R >= th[b]) & (R <= th[b + 1] + 1e-12))
+            masks.append(mb.to(torch.float32))
+        M = torch.stack(masks, dim=0)  # [BANDS,H,W]
         self._mask_cache[key] = M
         return M
 
@@ -75,25 +78,19 @@ class FBMFourierFeature(nn.Module):
         assert C == self.channels
 
         Fx = torch.fft.fft2(x, dim=(-2, -1))
-        Fx_shift = torch.fft.fftshift(Fx, dim=(-2, -1))
+        Fx_shift = torch.fft.fftshift(Fx, dim=(-2, -1))  # [B,C,H,W]
+        M = self._get_band_masks(H, W, x.device).to(Fx_shift.dtype)  # [BANDS,H,W]
 
-        M = self._get_band_masks(H, W, x.device)
-        x_b_list = []
-        for b in range(self.num_bands):
-            Mb = M[b].view(1, 1, H, W)  # [1,1,H,W]
-            Fxb_shift = Fx_shift * Mb
-            Fxb = torch.fft.ifftshift(Fxb_shift, dim=(-2, -1))
-            Xb = torch.fft.ifft2(Fxb, dim=(-2, -1)).real
-            x_b_list.append(Xb)  # [B,C,H,W]
-
-        Xb_stack = torch.stack(x_b_list, dim=1)  # [B,BANDS,C,H,W]
+        Fx_shift_b = Fx_shift[:, None, :, :, :] * M[None, :, None, :, :]  # [B,BANDS,C,H,W]
+        Fx_b = torch.fft.ifftshift(Fx_shift_b, dim=(-2, -1))
+        Xb_stack = torch.fft.ifft2(Fx_b, dim=(-2, -1)).real  # [B,BANDS,C,H,W]
 
         A_spa = torch.sigmoid(self.spa_head(x))  # [B,BANDS,H,W]
         A_glo = torch.sigmoid(self.glo_head(s)).view(B, self.num_bands, 1, 1)  # [B,BANDS,1,1]
-        A = A_spa * A_glo  # [B,BANDS,H,W]
-        A = 1.0 + self.att_scale * (A - 0.5)  # ~ [0.5,1.5]
+        A = 0.5 * (A_spa + A_glo)  # baseline=0.5
 
-        x_fbm = (Xb_stack * A.unsqueeze(2)).sum(dim=1)  # [B,C,H,W]
+        X_recon = Xb_stack.sum(dim=1)
+        x_fbm = X_recon + self.att_scale * ((A - 0.5).unsqueeze(2) * Xb_stack).sum(dim=1)
         return x_fbm
 
 class ChannelGainPerDomain(nn.Module):

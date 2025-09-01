@@ -45,7 +45,6 @@ class Solver(nn.Module):
         self.noise_losses = None
         if getattr(args, 'lambda_noise', 0.0) > 0 and getattr(args, 'noise_profile_paths', ''):
             paths = [p for p in args.noise_profile_paths.split(',') if p]
-            import torch.nn as nn
             self.noise_losses = nn.ModuleList([
                 NoiseHistogramLoss(
                     p,
@@ -78,6 +77,7 @@ class Solver(nn.Module):
             ]
 
             self.best_mae = float('inf')
+            self.ssim_train = SSIM(data_range=1.0, channel=4, size_average=True).to(self.device)
         else:
             if self.args.best_model:
                 ema_template = os.path.join(self.args.checkpoint_dir, 'best_nets_ema.ckpt')
@@ -163,7 +163,8 @@ class Solver(nn.Module):
 
             g_loss, g_losses_ref = compute_g_loss(
                 nets, args, x_real, y_org, y_trg, x_refs=[x_ref, x_ref2],
-                noise_loss_fn=self._noise_loss_batch
+                noise_loss_fn=self._noise_loss_batch,
+                ssim_fn=getattr(self, 'ssim_train', None)  # SSIM on [-1,1]
             )
             self._reset_grad()
             g_loss.backward()
@@ -390,7 +391,7 @@ def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref):
                        fake=loss_fake.item(),
                        reg=loss_reg.item())
 
-def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None):
+def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None, ssim_fn=None):
     x_ref, x_ref2 = x_refs
 
     # adversarial loss
@@ -409,17 +410,28 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None)
     x_fake2 = x_fake2.detach()
     loss_ds = torch.mean(torch.abs(x_fake - x_fake2))
 
-    # cycle-consistency loss
+    # cycle-consistency
     s_org = nets.style_encoder(x_real, y_org)
     x_rec = nets.generator(x_fake, s_org, y_org=y_trg, c_t=y_org)
     loss_cyc = torch.mean(torch.abs(x_rec - x_real))
+    if (ssim_fn is not None) and getattr(args, 'lambda_cyc_ssim', 0.0) > 0:
+        loss_cyc_ssim = 1.0 - ssim_fn(x_rec, x_real)
+    else:
+        loss_cyc_ssim = x_real.new_zeros([])
 
+    # identity (L1) + SSIM on [-1,1]
     lambda_id = getattr(args, 'lambda_id', 0.0)
     if lambda_id > 0:
         x_id = nets.generator(x_real, s_org, y_org=y_org, c_t=y_org)
         loss_id = torch.mean(torch.abs(x_id - x_real))
+        if (ssim_fn is not None) and getattr(args, 'lambda_id_ssim', 0.0) > 0:
+            loss_id_ssim = 1.0 - ssim_fn(x_id, x_real)
+        else:
+            loss_id_ssim = x_real.new_zeros([])
     else:
+        x_id = None
         loss_id = x_real.new_zeros([])
+        loss_id_ssim = x_real.new_zeros([])
 
     loss_noise = x_real.new_zeros([])
     if (noise_loss_fn is not None) and (getattr(args, 'lambda_noise', 0.0) > 0):
@@ -430,7 +442,9 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None)
             - args.lambda_ds * loss_ds
             + args.lambda_cyc * loss_cyc
             + getattr(args, 'lambda_noise', 0.0) * loss_noise
-            + lambda_id * loss_id)
+            + lambda_id * loss_id
+            + getattr(args, 'lambda_cyc_ssim', 0.0) * loss_cyc_ssim
+            + getattr(args, 'lambda_id_ssim', 0.0) * loss_id_ssim)
 
     return loss, Munch(
         adv=loss_adv.item(),
@@ -438,7 +452,9 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None)
         ds=loss_ds.item(),
         cyc=loss_cyc.item(),
         noise=loss_noise.item(),
-        id=loss_id.item()
+        id=loss_id.item(),
+        cyc_ssim=(loss_cyc_ssim.item() if torch.is_tensor(loss_cyc_ssim) else 0.0),
+        id_ssim=(loss_id_ssim.item() if torch.is_tensor(loss_id_ssim) else 0.0)
     )
 
 def moving_average(model, model_test, beta=0.999):
@@ -464,6 +480,7 @@ def r1_reg(d_out, x_in):
     reg = 0.5 * grad_dout2.view(batch_size, -1).sum(1).mean(0)
     return reg
 
+
 class NoiseHistogramLoss(nn.Module):
     def __init__(self, profile_path, patch_size=16, stride=None, keep_ratio=None, use_mad=True, device='cuda', eps=1e-8):
         super().__init__()
@@ -476,7 +493,8 @@ class NoiseHistogramLoss(nn.Module):
         else:
             target = torch.as_tensor(prof, device=device).float().unsqueeze(0)
             centers = torch.linspace(0, 1, target.shape[-1], device=device)
-            if keep_ratio is None: keep_ratio = 1.0
+            if keep_ratio is None:
+                keep_ratio = 1.0
         edges = torch.empty(centers.numel() + 1, device=device)
         edges[0] = 0.0
         edges[-1] = 1.0

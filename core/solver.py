@@ -276,6 +276,8 @@ class Solver(nn.Module):
         self.generator_ema.eval()
         self.style_encoder_ema.eval()
 
+        os.makedirs(self.args.result_dir, exist_ok=True)
+
         domains = sorted(os.listdir(self.args.val_img_dir))
         domain2idx = {d: i for i, d in enumerate(domains)}  # {iphone:0}
         pairs = [(s, t) for s in domains for t in domains if s != t]

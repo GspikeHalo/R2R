@@ -283,7 +283,7 @@ class Solver(nn.Module):
         pairs = [(s, t) for s in domains for t in domains if s != t]
 
         tot = {
-            f"{s}->{t}": {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "count": 0}
+            f"{s}->{t}": {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
             for s, t in pairs
         }
         tot_imgs = 0
@@ -292,7 +292,36 @@ class Solver(nn.Module):
             mse = ((x - y) ** 2).mean(dim=[1, 2, 3])
             return 10 * torch.log10(max_val ** 2 / (mse + eps))
 
+        def _sym_kl_hist(x, y, bins=256, eps=1e-8):
+            B, C, H, W = x.shape
+            out = x.new_zeros(B)
+            # per-image / per-channel histogram KL
+            for i in range(B):
+                kls = []
+                for c in range(C):
+                    # flatten channel
+                    xc = x[i, c].contiguous().view(-1)
+                    yc = y[i, c].contiguous().view(-1)
+                    # histograms on [0,1]
+                    px = torch.histc(xc, bins=bins, min=0.0, max=1.0)
+                    qx = torch.histc(yc, bins=bins, min=0.0, max=1.0)
+                    # normalize to distributions
+                    psum = px.sum()
+                    qsum = qx.sum()
+                    px = px / (psum + eps)
+                    qx = qx / (qsum + eps)
+                    # add epsilon for stability
+                    px_ = px + eps
+                    qx_ = qx + eps
+                    # KL(P||Q) and KL(Q||P)
+                    kld_pq = torch.sum(px_ * (torch.log(px_) - torch.log(qx_)))
+                    kld_qp = torch.sum(qx_ * (torch.log(qx_) - torch.log(px_)))
+                    kls.append(0.5 * (kld_pq + kld_qp))
+                out[i] = torch.stack(kls).mean()
+            return out  # [B]
+
         ssim_fn = SSIM(data_range=1.0, channel=4, size_average=False).to(self.device)
+        kl_bins = int(getattr(self.args, 'kl_bins', 256))
 
         for batch_i, (imgs_dict, filenames) in enumerate(
                 tqdm(self.test_loader, desc="Testing")):
@@ -311,18 +340,20 @@ class Solver(nn.Module):
 
                 s_t = self.style_encoder_ema(x_tgt, y_tgt)
                 x_fake = self.generator_ema(x_src, s_t, y_org=y_src, c_t=y_tgt)
-                x_fake_den = self.denorm(x_fake)
-                x_tgt_den = self.denorm(x_tgt)
+                x_fake_den = self.denorm(x_fake)   # [0,1]
+                x_tgt_den = self.denorm(x_tgt)     # [0,1]
 
-                mae = torch.abs(x_fake_den - x_tgt_den).view(B, -1) \
-                    .mean(dim=1).sum().item()
+                mae = torch.abs(x_fake_den - x_tgt_den).view(B, -1).mean(dim=1).sum().item()
                 psnr = _psnr(x_fake_den, x_tgt_den).sum().item()
                 ssim = ssim_fn(x_fake_den, x_tgt_den).sum().item()
+                kl_vals = _sym_kl_hist(x_fake_den, x_tgt_den, bins=kl_bins)
+                kl_sum = kl_vals.sum().item()
 
                 key = f"{src}->{tgt}"
                 tot[key]["mae"] += mae
                 tot[key]["psnr"] += psnr
                 tot[key]["ssim"] += ssim
+                tot[key]["kl"] += kl_sum
                 tot[key]["count"] += B
 
                 if not self.args.use_wandb:
@@ -342,21 +373,25 @@ class Solver(nn.Module):
             cnt = v["count"]
             print(f"{key}  MAE:{v['mae'] / cnt:.4f} "
                   f"PSNR:{v['psnr'] / cnt:.2f} "
-                  f"SSIM:{v['ssim'] / cnt:.4f}")
+                  f"SSIM:{v['ssim'] / cnt:.4f} "
+                  f"KL:{v['kl'] / cnt:.6f}")
 
-        # print overall micro-average across all pairs
+        # overall micro-average across all pairs
         total_mae = sum(v["mae"] for v in tot.values())
         total_psnr = sum(v["psnr"] for v in tot.values())
         total_ssim = sum(v["ssim"] for v in tot.values())
+        total_kl = sum(v["kl"] for v in tot.values())
         total_count = sum(v["count"] for v in tot.values())
 
         avg_mae = total_mae / total_count
         avg_psnr = total_psnr / total_count
         avg_ssim = total_ssim / total_count
+        avg_kl = total_kl / total_count
 
         print(f"Avg all  MAE:{avg_mae:.4f} "
               f"PSNR:{avg_psnr:.2f} "
-              f"SSIM:{avg_ssim:.4f}")
+              f"SSIM:{avg_ssim:.4f} "
+              f"KL:{avg_kl:.6f}")
 
         # -- WandB logging of evaluation metrics --
         if self.args.use_wandb:
@@ -366,10 +401,12 @@ class Solver(nn.Module):
                 metrics[f"{key}/MAE"] = v["mae"] / cnt
                 metrics[f"{key}/PSNR"] = v["psnr"] / cnt
                 metrics[f"{key}/SSIM"] = v["ssim"] / cnt
+                metrics[f"{key}/KL"] = v["kl"] / cnt
             # also log the micro-averages
             metrics["Avg/MAE"] = avg_mae
             metrics["Avg/PSNR"] = avg_psnr
             metrics["Avg/SSIM"] = avg_ssim
+            metrics["Avg/KL"] = avg_kl
             wandb.log(metrics, step=step)
 
         return avg_mae

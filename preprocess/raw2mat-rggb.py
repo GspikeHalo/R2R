@@ -57,21 +57,49 @@ def from_rggb_to_rgb(rggb):
     rggb[:, :, 2] = rggb[:, :, 3]
     return rggb[:, :, :3]
 
+def rggb4_to_bayer(rggb4, cfa):
+    assert rggb4.ndim == 3 and rggb4.shape[2] == 4, f"Expect (h,w,4), got {rggb4.shape}"
+    h, w, _ = rggb4.shape
+    cfa_t = cfa.copy()
+    cfa_t[cfa_t == 2] += 1
+    cfa_t[2:][cfa_t[2:] == 1] += 1
+    idx = [[0, 0], [0, 1], [1, 0], [1, 1]]
+    mosaic = np.empty((h * 2, w * 2), dtype=rggb4.dtype)
+    for k, c in enumerate(cfa_t):
+        rr, cc = idx[c]
+        mosaic[rr::2, cc::2] = rggb4[:, :, k]
+    return mosaic
+
 BASE_DIR   = '/media/Data_2/r2r_odb/'
 RESULT_DIR = '/media/Data_2/R2RResult/r2r-odb'
 
 pair_data = ['paired/', 'unpaired/']
-cameras   = ['huawei/', 'nikon/']
+cameras   = ['huawei/', 'nikon/', 'iphone/', 'samsung/']
 
 postfix_map = {
     'huawei/': '_A',
     'nikon/':  '_B',
+    'iphone/': '_C',
+    'samsung/': '_D',
 }
 
 meta_data_huawei = {'white_level': 4095,  'black_level': 256,
                     'cfa_pattern': np.array([2, 3, 1, 0])}
 meta_data_nikon  = {'white_level': 16383, 'black_level': 1008,
                     'cfa_pattern': np.array([0, 1, 3, 2])}
+
+meta_data_iphone   = {'white_level': 65535, 'black_level': 0,
+                      'cfa_pattern': np.array([0, 1, 2, 1])}
+meta_data_samsung  = {'white_level': 4095,  'black_level': 0,
+                      'cfa_pattern': np.array([0, 1, 2, 1])}
+
+camera_meta = {
+    'huawei/':  meta_data_huawei,
+    'nikon/':   meta_data_nikon,
+    'iphone/':  meta_data_iphone,
+    'samsung/': meta_data_samsung,
+}
+# -------------------------------------------------------------------------
 
 for _pair in pair_data:
     for _cam in cameras:
@@ -95,15 +123,24 @@ for _pair in pair_data:
         ]
         all_raw_img_paths.sort()
 
-        meta_data = meta_data_huawei if _cam == 'huawei/' else meta_data_nikon
+        meta_data = camera_meta[_cam]
 
         for raw_img_path in all_raw_img_paths:
             try:
                 with rawpy.imread(raw_img_path) as raw:
-                    raw_bayer = raw.raw_image_visible.copy()
+                    raw_data = raw.raw_image_visible.copy()
             except Exception as e:
                 print(f'[ERROR] Failed to read: {raw_img_path} -> {e}')
                 continue
+
+            if raw_data.ndim == 3 and raw_data.shape[2] == 4:
+                try:
+                    raw_bayer = rggb4_to_bayer(raw_data, deepcopy(meta_data['cfa_pattern']))
+                except Exception as e:
+                    print(f'[ERROR] RGGB4->Bayer failed: {raw_img_path} -> {e}')
+                    continue
+            else:
+                raw_bayer = raw_data
 
             if raw_bayer.ndim != 2:
                 print(f'[WARN] Not a 2D mosaic plane, skipped: {raw_img_path} (shape={raw_bayer.shape})')

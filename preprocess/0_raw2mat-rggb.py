@@ -17,12 +17,18 @@ def check_dir(path_):
 def pack_rggb(raw_image, cfa):
     """Pack a Bayer 2D plane into 4-channel RGGB according to the given CFA order."""
     height, width = raw_image.shape
-    channels = []
-    cfa = cfa.copy()
-    cfa[cfa == 2] += 1
-    cfa[2:][cfa[2:] == 1] += 1
     idx = [[0, 0], [0, 1], [1, 0], [1, 1]]
-    for c in cfa:
+
+    cfa = np.array(cfa, dtype=int).copy()
+
+    if int(cfa.max()) < 3:
+        cfa[cfa == 2] += 1
+        cfa[2:][cfa[2:] == 1] += 1
+        cfa_pos = cfa
+    else:
+        cfa_pos = cfa
+    channels = []
+    for c in cfa_pos:
         raw_c = raw_image[idx[c][0]:height:2, idx[c][1]:width:2].copy()
         channels.append(raw_c)
     return np.stack(channels, axis=-1)
@@ -87,7 +93,6 @@ meta_data_huawei = {'white_level': 4095,  'black_level': 256,
                     'cfa_pattern': np.array([2, 3, 1, 0])}
 meta_data_nikon  = {'white_level': 16383, 'black_level': 1008,
                     'cfa_pattern': np.array([0, 1, 3, 2])}
-
 meta_data_iphone   = {'white_level': 65535, 'black_level': 0,
                       'cfa_pattern': np.array([0, 1, 2, 1])}
 meta_data_samsung  = {'white_level': 4095,  'black_level': 0,
@@ -99,23 +104,29 @@ camera_meta = {
     'iphone/':  meta_data_iphone,
     'samsung/': meta_data_samsung,
 }
-# -------------------------------------------------------------------------
 
 for _pair in pair_data:
+    def get_out_dirs(pair_tag, cam_tag):
+        if pair_tag == 'paired/':
+            out_rggb_dir = os.path.join(RESULT_DIR, 'paired', 'raw')
+            out_vis_dir  = os.path.join(RESULT_DIR, 'paired', 'jpg')
+        else:
+            out_rggb_dir = os.path.join(RESULT_DIR, pair_tag, cam_tag, 'raw-rggb')
+            out_vis_dir  = os.path.join(RESULT_DIR, pair_tag, cam_tag, 'vis')
+        return out_rggb_dir, out_vis_dir
+
     for _cam in cameras:
         postfix = postfix_map[_cam]
 
         path_to_raw_data = os.path.join(BASE_DIR, _pair, _cam)
-        out_rggb_dir = os.path.join(RESULT_DIR, _pair, _cam, 'raw-rggb/')
-        out_vis_dir  = os.path.join(RESULT_DIR, _pair, _cam, 'vis/')
-
-        check_dir(out_rggb_dir)
-        check_dir(out_vis_dir)
-
         in_dir = os.path.join(path_to_raw_data, 'raw')
         if not os.path.isdir(in_dir):
             print(f'[WARN] Skip: directory not found: {in_dir}')
             continue
+
+        out_rggb_dir, out_vis_dir = get_out_dirs(_pair, _cam)
+        check_dir(out_rggb_dir)
+        check_dir(out_vis_dir)
 
         all_raw_img_paths = [
             os.path.join(in_dir, f) for f in os.listdir(in_dir)

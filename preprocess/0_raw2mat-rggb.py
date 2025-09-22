@@ -11,11 +11,6 @@ def apply_orient(arr, mode):
     """
     对 2D/3D(H,W,C) 数组做手动翻转/旋转 (manual flip/rotation).
     mode ∈ {'none','cw90','ccw90','rot180','hflip','vflip'}
-      - 'cw90'   : 顺时针 90° (clockwise 90)
-      - 'ccw90'  : 逆时针 90° (counter-clockwise 90)
-      - 'rot180' : 旋转 180°
-      - 'hflip'  : 水平翻转 (horizontal)
-      - 'vflip'  : 垂直翻转 (vertical)
     """
     if mode in (None, 'none'):
         return arr
@@ -31,8 +26,6 @@ def apply_orient(arr, mode):
         return np.flip(arr, axis=0)
     raise ValueError(f"Unknown orientation mode: {mode}")
 
-
-
 def check_dir(path_):
     if not os.path.exists(path_):
         try:
@@ -43,7 +36,7 @@ def check_dir(path_):
 
 def imwrite(filename, image):
     """Save RGB float image in [0,1] to an 8-bit file."""
-    image = np.clip(image, 0.0, 1.0) * 255.0  # 你已改为 255，这里保持
+    image = np.clip(image, 0.0, 1.0) * 255.0
     image = image.astype(np.uint8)
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     cv2.imwrite(filename, image)
@@ -59,7 +52,6 @@ def _cfa_to_pos_order(cfa):
         raise ValueError(f"CFA must have 4 entries, got {cfa.size}: {cfa}")
 
     vals = np.unique(cfa)
-
     if set(vals.tolist()) == {0, 1, 2, 3} and np.all(np.sort(cfa) == np.array([0, 1, 2, 3])):
         return cfa
 
@@ -75,7 +67,6 @@ def _cfa_to_pos_order(cfa):
 
     g_pos = np.sort(g_pos)
     return np.array([int(r_pos[0]), int(g_pos[0]), int(g_pos[1]), int(b_pos[0])], dtype=int)
-
 
 def pos_order_from_raw(raw):
     """
@@ -99,7 +90,6 @@ def pos_order_from_raw(raw):
 
     raise ValueError(f"Unsupported CFA for RGGB/RYYB-style packing: letters={letters}, color_desc={cdesc}")
 
-
 def pack_rggb(raw_image, cfa):
     """
     将 Bayer 2D 马赛克 (Bayer mosaic) 打包为 4 通道 RGGB。
@@ -109,8 +99,8 @@ def pack_rggb(raw_image, cfa):
         raise ValueError(f"raw_image must be 2D, got shape {raw_image.shape}")
 
     h, w = raw_image.shape
-    pos_order = _cfa_to_pos_order(cfa)  # 长度 4，元素 ∈ {0,1,2,3}
-    idx = [(0, 0), (0, 1), (1, 0), (1, 1)]  # 2×2 位置到采样步进
+    pos_order = _cfa_to_pos_order(cfa)
+    idx = [(0, 0), (0, 1), (1, 0), (1, 1)]
 
     channels = []
     for pos in pos_order:
@@ -122,36 +112,75 @@ def pack_rggb(raw_image, cfa):
     if not all(ch.shape == base_shape for ch in channels):
         raise RuntimeError(f"Packed channel shapes mismatch: {[ch.shape for ch in channels]}")
 
-    return np.stack(channels, axis=-1)  # [R,G1,G2,B]
-
+    return np.stack(channels, axis=-1)
 
 def from_rggb_to_rgb(rggb):
     """可视化：合并两路 G 并按 RGB 返回（不就地修改输入）。"""
     g = (rggb[..., 1] + rggb[..., 2]) / 2.0
     return np.stack([rggb[..., 0], g, rggb[..., 3]], axis=-1)
 
+def reorder_raw4ch_to_rggb4(raw4, raw):
+    """
+    将 4 通道 linear-raw 依据 color_desc 重排为 [R,G1,G2,B]。
+    把 'Y' 当作 G-like。
+    """
+    cdesc = raw.color_desc.decode() if isinstance(raw.color_desc, bytes) else raw.color_desc
+    ch_letters = [cdesc[i] for i in range(raw4.shape[2])]
+    idx_r = [i for i, L in enumerate(ch_letters) if L == 'R']
+    idx_b = [i for i, L in enumerate(ch_letters) if L == 'B']
+    idx_g = [i for i, L in enumerate(ch_letters) if L in ('G', 'Y')]
+
+    if len(idx_r) != 1 or len(idx_b) != 1 or len(idx_g) != 2:
+        raise ValueError(f"Unexpected 4ch order: color_desc={cdesc}, ch_letters={ch_letters}")
+
+    idx_g.sort()
+    order = [idx_r[0], idx_g[0], idx_g[1], idx_b[0]]
+    return raw4[:, :, order]
+
+def rggb4_to_bayer(rggb4, pos_order):
+    """
+    4 通道 [R,G1,G2,B] → 2D Bayer mosaic (按 pos_order 把通道放回 2×2 网格).
+    """
+    assert rggb4.ndim == 3 and rggb4.shape[2] == 4, f"Expect (H,W,4), got {rggb4.shape}"
+    h, w, _ = rggb4.shape
+    idx = [(0, 0), (0, 1), (1, 0), (1, 1)]
+    mosaic = np.empty((h * 2, w * 2), dtype=rggb4.dtype)
+    for k, pos in enumerate(pos_order):
+        rr, cc = idx[pos]
+        mosaic[rr::2, cc::2] = rggb4[:, :, k]
+    return mosaic
+
 BASE_DIR   = '/media/Data_2/r2r_odb/'
 RESULT_DIR = '/media/Data_2/R2RResult/r2r-odb'
 
 pair_data = ['paired/', 'unpaired/']
-cameras   = ['huawei/', 'nikon/']
+cameras   = ['huawei/', 'nikon/', 'iphone/', 'samsung/']
 
 postfix_map = {
     'huawei/': '_A',
     'nikon/':  '_B',
+    'iphone/': '_C',
+    'samsung/':'_D',
 }
 
 meta_data_huawei = {'white_level': 4095,  'black_level': 256,  'cfa_pattern': np.array([2, 3, 1, 0])}
 meta_data_nikon  = {'white_level': 16383, 'black_level': 1008, 'cfa_pattern': np.array([0, 1, 3, 2])}
+# ★ 新增：iPhone / Samsung 的 meta（用于归一化；可按相机实际再调）
+meta_data_iphone  = {'white_level': 65535, 'black_level': 0,    'cfa_pattern': np.array([0, 1, 2, 3])}
+meta_data_samsung = {'white_level': 4095, 'black_level': 0,    'cfa_pattern': np.array([0, 1, 2, 3])}
 
 camera_meta = {
-    'huawei/': meta_data_huawei,
-    'nikon/':  meta_data_nikon,
+    'huawei/':  meta_data_huawei,
+    'nikon/':   meta_data_nikon,
+    'iphone/':  meta_data_iphone,
+    'samsung/': meta_data_samsung,
 }
 
 ORIENT_PER_CAMERA = {
-    'huawei/': 'none',   # 华为不翻转
-    'nikon/':  'hflip',   # 尼康：默认顺时针90°；如方向不对，改成 'ccw90' / 'rot180' / 'hflip' / 'vflip'
+    'huawei/': 'none',
+    'nikon/':  'hflip',
+    'iphone/': 'none',
+    'samsung/':'none',
 }
 
 for _pair in pair_data:
@@ -189,12 +218,19 @@ for _pair in pair_data:
         for raw_img_path in all_raw_img_paths:
             try:
                 with rawpy.imread(raw_img_path) as raw:
-                    raw_bayer = raw.raw_image_visible.copy()
+                    data = raw.raw_image_visible.copy()
 
                     try:
                         pos_order = pos_order_from_raw(raw)
                     except Exception:
                         pos_order = deepcopy(meta_data['cfa_pattern'])
+
+                    if data.ndim == 3 and data.shape[2] == 4:
+                        raw4 = data.astype(np.float32)
+                        rggb4 = reorder_raw4ch_to_rggb4(raw4, raw)
+                        raw_bayer = rggb4_to_bayer(rggb4, pos_order)
+                    else:
+                        raw_bayer = data
 
             except Exception as e:
                 print(f'[ERROR] Failed to read: {raw_img_path} -> {e}')
@@ -210,7 +246,7 @@ for _pair in pair_data:
             raw_bayer_norm = (raw_bayer.astype(np.float32) - bl) / denom
             raw_bayer_norm = np.clip(raw_bayer_norm, 0.0, 1.0)
 
-            raw_rggb = pack_rggb(raw_bayer_norm, pos_order)
+            raw_rggb = pack_rggb(raw_bayer_norm, deepcopy(pos_order))
             raw_rggb = apply_orient(raw_rggb, ORIENT_PER_CAMERA.get(_cam, 'none'))
 
             stem = os.path.splitext(os.path.basename(raw_img_path))[0]

@@ -119,6 +119,16 @@ def build_profile(files, bins_n, patch, stride, keep_ratio, device, smooth_passe
 # OUTPUT_FILE = 'noise_profiles/iphone_profile.pt'
 # IMG_DIR = '/media/Data_2/R2RResult/processed/unpaired/samsung-s9'
 # OUTPUT_FILE = 'noise_profiles/samsung_profile.pt'
+
+# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb/processed/unpaired/huawei'
+# OUTPUT_FILE = 'noise_profiles/huawei_profile.pt'
+# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb/processed/unpaired/iphone'
+# OUTPUT_FILE = 'noise_profiles/iphone_profile.pt'
+# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb/processed/unpaired/nikon'
+# OUTPUT_FILE = 'noise_profiles/nikon_profile.pt'
+# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb/processed/unpaired/samsung'
+# OUTPUT_FILE = 'noise_profiles/samsung_profile.pt'
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--img_dir', type=str, required=True)

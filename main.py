@@ -1,13 +1,3 @@
-"""
-StarGAN v2
-Copyright (c) 2020-present NAVER Corp.
-
-This work is licensed under the Creative Commons Attribution-NonCommercial
-4.0 International License. To view a copy of this license, visit
-http://creativecommons.org/licenses/by-nc/4.0/ or send a letter to
-Creative Commons, PO Box 1866, Mountain View, CA 94042, USA.
-"""
-
 import os
 import argparse
 
@@ -21,10 +11,18 @@ from pathlib import Path
 
 import wandb
 
+
 FIXINPUT={
-    'iphone-x': ['3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy'],
-    'samsung-s9': [ '3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy']
+    'iphone': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',],
+    'samsung': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',],
+    'huawei': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',],
+    'nikon': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',]
 }
+
+# FIXINPUT={
+#     'iphone-x': ['3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy'],
+#     'samsung-s9': [ '3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy']
+# }
 
 # FIXINPUT={
 #     'iphone-x': ['3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy',
@@ -57,7 +55,7 @@ def main(args):
             project='StarGAN-R2R',
             entity='bias-lab',
             config=vars(args),
-            name="raw2raw-multi-kernel-without-random-noise"
+            name="our_db"
         )
 
     solver = Solver(args)
@@ -106,7 +104,7 @@ if __name__ == '__main__':
     # model arguments
     parser.add_argument('--img_size', type=int, default=256,
                         help='Image resolution')
-    parser.add_argument('--num_domains', type=int, default=2,
+    parser.add_argument('--num_domains', type=int, default=4,
                         help='Number of domains')
     parser.add_argument('--style_dim', type=int, default=64,
                         help='Style code dimension')
@@ -161,19 +159,19 @@ if __name__ == '__main__':
                         help='Seed for random number generator')
 
     # directory for training
-    parser.add_argument('--train_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
+    parser.add_argument('--train_img_dir', type=str, default='/media/Data_2/R2RResult/r2r-odb/processed/unpaired',
                         help='Directory containing training images')
-    parser.add_argument('--val_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/test',
+    parser.add_argument('--val_img_dir', type=str, default='/media/Data_2/R2RResult/r2r-odb/processed/test',
                         help='Directory containing validation images')
-    parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
+    parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/r2r-odb/processed/unpaired',
                         help='Directory for saving generated images')
-    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-multi-kernel-3/expr/checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/out_db/expr/checkpoints',
                         help='Directory for saving network checkpoints')
     parser.add_argument('--noise_profile_paths', type=str,
-                        default='./preprocess/noise_profiles/iphone_profile.pt,./preprocess/noise_profiles/samsung_profile.pt')
+                        default='./preprocess/noise_profiles/iphone_profile.pt,./preprocess/noise_profiles/samsung_profile.pt,./preprocess/noise_profiles/huawei_profile.pt,./preprocess/noise_profiles/nikon_profile.pt')
 
     # directory for testing
-    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-multi-kernel-3/expr/results',
+    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/out_db/expr/results',
                         help='Directory for saving generated images and videos')
 
     # step size

@@ -120,14 +120,22 @@ def build_profile(files, bins_n, patch, stride, keep_ratio, device, smooth_passe
 # IMG_DIR = '/media/Data_2/R2RResult/processed/unpaired/samsung-s9'
 # OUTPUT_FILE = 'noise_profiles/samsung_profile.pt'
 
-# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb/processed/unpaired/huawei'
+# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb-new/processed/unpaired/huawei'
 # OUTPUT_FILE = 'noise_profiles/huawei_profile.pt'
-# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb/processed/unpaired/iphone'
+# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb-new/processed/unpaired/iphone'
 # OUTPUT_FILE = 'noise_profiles/iphone_profile.pt'
-# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb/processed/unpaired/nikon'
+# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb-new/processed/unpaired/nikon'
 # OUTPUT_FILE = 'noise_profiles/nikon_profile.pt'
-# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb/processed/unpaired/samsung'
+# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb-new/processed/unpaired/samsung'
 # OUTPUT_FILE = 'noise_profiles/samsung_profile.pt'
+# IMG_DIR = '/media/Data_2/R2RResult/r2r-odb-new/processed/unpaired/canon'
+# OUTPUT_FILE = 'noise_profiles/canon_profile.pt'
+
+# python build_noise_profile.py --img_dir /media/Data_2/R2RResult/r2r-odb-new/processed/unpaired/huawei --out noise_profiles/huawei_profile.pt
+# python build_noise_profile.py --img_dir /media/Data_2/R2RResult/r2r-odb-new/processed/unpaired/iphone --out noise_profiles/iphone_profile.pt
+# python build_noise_profile.py --img_dir /media/Data_2/R2RResult/r2r-odb-new/processed/unpaired/nikon --out noise_profiles/nikon_profile.pt
+# python build_noise_profile.py --img_dir /media/Data_2/R2RResult/r2r-odb-new/processed/unpaired/samsung --out noise_profiles/samsung_profile.pt
+# python build_noise_profile.py --img_dir /media/Data_2/R2RResult/r2r-odb-new/processed/unpaired/canon --out noise_profiles/canon_profile.pt
 
 def main():
     ap = argparse.ArgumentParser()

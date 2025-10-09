@@ -24,10 +24,13 @@ POSTFIX_TO_CAM = {
     'B': 'nikon',
     'C': 'iphone',
     'D': 'samsung',
+    'E': 'canon'
 }
-CAMERAS = ['iphone', 'huawei', 'nikon', 'samsung']  # 可改成你想要的顺序
+# CAMERAS = ['iphone', 'huawei', 'nikon', 'samsung', 'canon']
+CAMERAS = ['huawei', 'nikon']
 
-RAW_VAR_CANDIDATES = ['raw_rggb']  # 如有别名可加在这里，比如 'raw4', 'raw'
+
+RAW_VAR_CANDIDATES = ['raw_rggb']
 
 def split_large_image(**kwargs):
     image, type = kwargs['image'],kwargs['type']
@@ -81,7 +84,7 @@ if __name__ == '__main__':
     parser.add_argument('--type', choices=['zoom', 'split'], default='split')  # 切块策略 patching strategy
     parser.add_argument('--processed_image_size', type=list, default=[512, 384])  # 仅在 type=zoom 时使用
     parser.add_argument('--patch_size', default=256, type=int)  # 四通道 RGGB 的 patch 尺寸
-    parser.add_argument('--parent_path', default='/media/Data_2/R2RResult/r2r-odb/')
+    parser.add_argument('--parent_path', default='/media/Data_2/R2RResult/r2r-odb-v2/')
     parser.add_argument('--paired_data_path', default='paired')
     parser.add_argument('--unpaired_data_path', default='unpaired')
     parser.add_argument('--processed_data_path', default='processed')
@@ -106,7 +109,7 @@ if __name__ == '__main__':
     # -----------------------------
     paired_raw_dir = os.path.join(args.paired_data_path, 'raw')
     if os.path.isdir(paired_raw_dir):
-        file_re = re.compile(r'^(?P<stem>.+)_(?P<code>[ABCD])\.mat$', re.IGNORECASE)
+        file_re = re.compile(r'^(?P<stem>.+)_(?P<code>[ABCDE])\.mat$', re.IGNORECASE)
         groups = {}
         for fn in os.listdir(paired_raw_dir):
             if not fn.lower().endswith('.mat'):

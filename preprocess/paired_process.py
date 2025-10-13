@@ -1,34 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-在原有基础上增加：
-- patch 可视化输出（已存在）
-- 连线可视化输出：ratio 通过(橙色)与 RANSAC 内点(绿色)
-
-可视化路径：
-  RESULT_DIR/paired/matches/<stem>_ratio.png
-  RESULT_DIR/paired/matches/<stem>_inliers.png
-  RESULT_DIR/paired/patches/vis_A/*.png
-  RESULT_DIR/paired/patches/vis_B/*.png
-  RESULT_DIR/paired/patches/vis_AB/*.png
-"""
 
 import os
 import errno
 import traceback
 from copy import deepcopy
+from itertools import combinations
 
 import cv2
 import numpy as np
 import rawpy
 from scipy.io import savemat
 
-# ---------------------------
-# 全局目标尺寸（强制偶数）
-# ---------------------------
+# =========================
+# 全局参数
+# =========================
 TARGET_W = 2000
 TARGET_H = 1500
 PAD_VALUE = 0.0
+
+# 传统算法参数（SIFT + FLANN + RANSAC）
+SIFT_NFEATURES = 10000
+LOWE_RATIO = 0.92
+RANSAC_REPROJ = 5.0
+
+PATCH_RGGB = 256
+NMS_MIN_DIST = int(0.8 * PATCH_RGGB)
 
 def _floor_even(x: int) -> int:
     x = int(x)
@@ -37,22 +34,17 @@ def _floor_even(x: int) -> int:
 TARGET_W = _floor_even(TARGET_W)
 TARGET_H = _floor_even(TARGET_H)
 
-# ---------------------------
+# =========================
 # 基础工具
-# ---------------------------
+# =========================
 def apply_orient(arr, mode):
     if mode in (None, 'none'):
         return arr
-    if mode == 'cw90':
-        return np.rot90(arr, -1, axes=(0, 1))
-    if mode == 'ccw90':
-        return np.rot90(arr,  1, axes=(0, 1))
-    if mode == 'rot180':
-        return np.rot90(arr,  2, axes=(0, 1))
-    if mode == 'hflip':
-        return np.flip(arr, axis=1)
-    if mode == 'vflip':
-        return np.flip(arr, axis=0)
+    if mode == 'cw90':  return np.rot90(arr, -1, axes=(0, 1))
+    if mode == 'ccw90': return np.rot90(arr,  1, axes=(0, 1))
+    if mode == 'rot180':return np.rot90(arr,  2, axes=(0, 1))
+    if mode == 'hflip': return np.flip(arr, axis=1)
+    if mode == 'vflip': return np.flip(arr, axis=0)
     raise ValueError(f"Unknown orientation mode: {mode}")
 
 def check_dir(path_):
@@ -64,26 +56,28 @@ def check_dir(path_):
                 raise
 
 def imwrite(filename, image_rgb01):
-    """image_rgb01: RGB, [0,1] float32"""
-    image = np.nan_to_num(image_rgb01, nan=0.0, posinf=1.0, neginf=0.0)
-    image = np.clip(image, 0.0, 1.0) * 255.0
-    image = image.astype(np.uint8)
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    ok = cv2.imwrite(filename, image)
+    img = np.nan_to_num(image_rgb01, nan=0.0, posinf=1.0, neginf=0.0)
+    img = np.clip(img, 0.0, 1.0) * 255.0
+    img = img.astype(np.uint8)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    ok = cv2.imwrite(filename, img)
     if not ok:
-        print(f"[ERROR] cv2.imwrite 失败：{filename}")
+        print(f"[ERROR] 写入失败：{filename}")
 
-# ---------------------------
+def cam_tag_to_name(tag: str) -> str:
+    return tag.strip('/')
+
+# =========================
 # RGGB 打包/解包
-# ---------------------------
+# =========================
 def _cfa_to_pos_order(cfa):
     cfa = np.asarray(cfa, dtype=int).ravel()
     if cfa.size != 4:
         raise ValueError(f"CFA must have 4 entries, got {cfa.size}: {cfa}")
     vals = np.unique(cfa)
-    if set(vals.tolist()) == {0, 1, 2, 3} and np.all(np.sort(cfa) == np.array([0, 1, 2, 3])):
+    if set(vals.tolist()) == {0,1,2,3} and np.all(np.sort(cfa)==np.array([0,1,2,3])):
         return cfa
-    if not set(vals.tolist()).issubset({0, 1, 2, 3}):
+    if not set(vals.tolist()).issubset({0,1,2,3}):
         raise ValueError(f"Unsupported CFA values: {vals}")
     r_pos = np.where(cfa == 0)[0]
     b_pos = np.where(cfa == 2)[0]
@@ -98,65 +92,51 @@ def pack_rggb(raw_bayer_2d, cfa):
         raise ValueError(f"raw_image must be 2D, got shape {raw_bayer_2d.shape}")
     h, w = raw_bayer_2d.shape
     pos_order = _cfa_to_pos_order(cfa)
-    idx = [(0, 0), (0, 1), (1, 0), (1, 1)]
+    idx = [(0,0),(0,1),(1,0),(1,1)]
     channels = []
     for pos in pos_order:
         rr, cc = idx[pos]
         ch = raw_bayer_2d[rr:h:2, cc:w:2].copy()
         channels.append(ch)
-    base_shape = channels[0].shape
-    if not all(ch.shape == base_shape for ch in channels):
+    base = channels[0].shape
+    if not all(ch.shape == base for ch in channels):
         raise RuntimeError(f"Packed channel shapes mismatch: {[ch.shape for ch in channels]}")
     return np.stack(channels, axis=-1)
 
 def from_rggb_to_rgb(rggb):
-    """合并 G1/G2 -> G，输出线性 RGB（不超过 [0,1]）"""
-    g = (rggb[..., 1] + rggb[..., 2]) / 2.0
-    return np.stack([rggb[..., 0], g, rggb[..., 3]], axis=-1)
+    g = (rggb[...,1] + rggb[...,2]) / 2.0
+    return np.stack([rggb[...,0], g, rggb[...,3]], axis=-1)
 
-# ---------------------------
-# 只下采样统一化（RGGB 四通道逐平面）
-# ---------------------------
+# =========================
+# 下采样统一化
+# =========================
 def _resize_rggb_downsample(raw_rggb: np.ndarray, new_w: int, new_h: int) -> np.ndarray:
-    assert raw_rggb.ndim == 3 and raw_rggb.shape[2] == 4
     out = np.empty((new_h, new_w, 4), dtype=raw_rggb.dtype)
     for i in range(4):
         out[..., i] = cv2.resize(raw_rggb[..., i], (new_w, new_h), interpolation=cv2.INTER_AREA)
     return out
 
 def fit_cover_center_crop_downsample_only(raw_rggb: np.ndarray, tw: int, th: int) -> np.ndarray:
-    assert raw_rggb.ndim == 3 and raw_rggb.shape[2] == 4
     h, w, _ = raw_rggb.shape
     if h < th or w < tw:
-        raise RuntimeError(f"Input too small for downsample-only cover: got ({h},{w}), need >= ({th},{tw}).")
+        raise RuntimeError(f"Input too small: ({h},{w}) < ({th},{tw})")
     scale = max(tw / w, th / h)
     new_w = _floor_even(int(round(w * scale)))
     new_h = _floor_even(int(round(h * scale)))
-    if new_w < tw: new_w = tw
-    if new_h < th: new_h = th
-    if new_w < w or new_h < h:
-        resized = _resize_rggb_downsample(raw_rggb, new_w, new_h)
-    else:
-        resized = raw_rggb
-    y0 = (new_h - th) // 2
-    x0 = (new_w - tw) // 2
+    new_w = max(new_w, tw); new_h = max(new_h, th)
+    resized = _resize_rggb_downsample(raw_rggb, new_w, new_h) if (new_w < w or new_h < h) else raw_rggb
+    y0 = (new_h - th) // 2; x0 = (new_w - tw) // 2
     cropped = resized[y0:y0+th, x0:x0+tw, :]
     if cropped.shape[0] != th or cropped.shape[1] != tw:
-        cropped_fixed = np.zeros((th, tw, 4), dtype=cropped.dtype)
+        fixed = np.zeros((th, tw, 4), dtype=cropped.dtype)
         hh = min(th, cropped.shape[0]); ww = min(tw, cropped.shape[1])
-        cropped_fixed[:hh, :ww, :] = cropped[:hh, :ww, :]
-        cropped = cropped_fixed
+        fixed[:hh, :ww, :] = cropped[:hh, :ww, :]
+        cropped = fixed
     return cropped.astype(np.float32)
 
-# ---------------------------
-# 匹配、NMS 与同步裁剪（沿用之前的方法）
-# ---------------------------
-SIFT_NFEATURES = 10000
-LOWE_RATIO = 0.92
-RANSAC_REPROJ = 5.0
-PATCH_RGGB = 256
-NMS_MIN_DIST = int(0.8 * PATCH_RGGB)
-
+# =========================
+# 传统匹配（SIFT + FLANN + RANSAC）
+# =========================
 def sift_flann_ransac(gray1: np.ndarray, gray2: np.ndarray,
                       nfeatures=SIFT_NFEATURES, ratio=LOWE_RATIO, ransac_reproj=RANSAC_REPROJ):
     sift = cv2.SIFT_create(nfeatures=nfeatures)
@@ -164,7 +144,7 @@ def sift_flann_ransac(gray1: np.ndarray, gray2: np.ndarray,
     kps2, des2 = sift.detectAndCompute(gray2, None)
     if des1 is None or des2 is None or len(kps1) < 2 or len(kps2) < 2:
         return kps1 or [], kps2 or [], [], []
-    index_params = dict(algorithm=1, trees=5)  # FLANN KD-Tree
+    index_params = dict(algorithm=1, trees=5)   # FLANN KD-Tree
     search_params = dict(checks=64)
     flann = cv2.FlannBasedMatcher(index_params, search_params)
     knn = flann.knnMatch(des1, des2, k=2)
@@ -184,7 +164,7 @@ def sift_flann_ransac(gray1: np.ndarray, gray2: np.ndarray,
 def nms_by_center_distance(kps1, kps2, matches, min_dist=NMS_MIN_DIST):
     kept, centers1, centers2 = [], [], []
     r2 = float(min_dist * min_dist)
-    for m in matches:
+    for m in sorted(matches, key=lambda mm: mm.distance):
         x1, y1 = kps1[m.queryIdx].pt
         x2, y2 = kps2[m.trainIdx].pt
         ok1 = all((x1 - cx1)**2 + (y1 - cy1)**2 >= r2 for (cx1, cy1) in centers1)
@@ -197,7 +177,7 @@ def nms_by_center_distance(kps1, kps2, matches, min_dist=NMS_MIN_DIST):
 def crop_pair_shift_sync(arr1, cx1, cy1, arr2, cx2, cy2, size=PATCH_RGGB):
     H1, W1 = arr1.shape[:2]; H2, W2 = arr2.shape[:2]; s = int(size)
     if W1 < s or H1 < s or W2 < s or H2 < s:
-        raise RuntimeError("Image smaller than patch size; check preprocessing/target size.")
+        raise RuntimeError("Image smaller than patch size")
     x01 = int(round(cx1)) - s // 2; y01 = int(round(cy1)) - s // 2
     x02 = int(round(cx2)) - s // 2; y02 = int(round(cy2)) - s // 2
     dx_lo = max(-x01, -x02); dx_hi = min(W1 - s - x01, W2 - s - x02)
@@ -209,20 +189,13 @@ def crop_pair_shift_sync(arr1, cx1, cy1, arr2, cx2, cy2, size=PATCH_RGGB):
     x2 = clamp(x02 + int(dx), 0, W2 - s); y2 = clamp(y02 + int(dy), 0, H2 - s)
     return arr1[y1:y1+s, x1:x1+s, :].copy(), arr2[y2:y2+s, x2:x2+s, :].copy()
 
-# ---------------------------
-# 连线可视化（整图）
-# ---------------------------
-def draw_matches(rgb1: np.ndarray, rgb2: np.ndarray,
-                 kps1, kps2, matches, inliers_only=True) -> np.ndarray:
-    """横向拼接两图，并画匹配连线；绿色=内点，橙色=ratio 通过但未 RANSAC。"""
+def draw_matches(rgb1, rgb2, kps1, kps2, matches, inliers_only=True):
     h1, w1 = rgb1.shape[:2]; h2, w2 = rgb2.shape[:2]
     canvas = np.zeros((max(h1, h2), w1 + w2, 3), dtype=np.uint8)
     canvas[:h1, :w1] = (np.clip(rgb1, 0, 1) * 255).astype(np.uint8)
     canvas[:h2, w1:w1+w2] = (np.clip(rgb2, 0, 1) * 255).astype(np.uint8)
-
-    color = (0, 255, 0) if inliers_only else (255, 180, 0)  # RGB
+    color = (0,255,0) if inliers_only else (255,180,0)
     color_bgr = (color[2], color[1], color[0])
-
     for m in matches:
         x1, y1 = kps1[m.queryIdx].pt
         x2, y2 = kps2[m.trainIdx].pt
@@ -231,21 +204,16 @@ def draw_matches(rgb1: np.ndarray, rgb2: np.ndarray,
         cv2.circle(canvas, p1, 3, color_bgr, -1, cv2.LINE_AA)
         cv2.circle(canvas, p2, 3, color_bgr, -1, cv2.LINE_AA)
         cv2.line(canvas, p1, p2, color_bgr, 1, cv2.LINE_AA)
-
-    # 返回 [0,1] 的 RGB 便于统一 imwrite
     return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
-# ---------------------------
-# 数据目录
-# ---------------------------
-BASE_DIR = r'F:\LocalFile\ShenghaoFu\R2R\r2r_odb_v2'
+# =========================
+# 数据与元信息
+# =========================
+BASE_DIR   = r'F:\LocalFile\ShenghaoFu\R2R\r2r_odb_v2'
 RESULT_DIR = r'.\results'
-# BASE_DIR   = '/media/Data_2/r2r_odb_v2/'
-# RESULT_DIR = '/media/Data_2/R2RResult/r2r-odb-v2'
 
-pair_data = ['paired/']
-# pair_data = ['paired/', 'unpaired/']
-cameras   = ['huawei/', 'nikon/']
+# 在这里列出 2–5 个域
+cameras   = ['huawei/', 'nikon/', 'iphone/', 'samsung/', 'canon/']  # 可删改
 
 postfix_map = {
     'huawei/': '_A',
@@ -255,7 +223,6 @@ postfix_map = {
     'canon/':  '_E'
 }
 
-# 相机元数据
 meta_data_huawei  = {'white_level': 4095,  'black_level': 256,  'cfa_pattern': np.array([3, 1, 2, 0])}
 meta_data_nikon   = {'white_level': 16383, 'black_level': 1008, 'cfa_pattern': np.array([0, 1, 2, 3])}
 meta_data_iphone  = {'white_level': 4095,  'black_level': 528,  'cfa_pattern': np.array([3, 1, 2, 0])}
@@ -275,7 +242,7 @@ ORIENT_PER_CAMERA = {
     'nikon/':   'rot180',
     'iphone/':  'none',
     'samsung/': 'none',
-    'canon/':   'hflip'
+    'canon/':   'rot180'
 }
 
 RAW_EXTS = ('.dng', '.nef', '.cr2', '.cr3', '.arw', '.rw2')
@@ -294,170 +261,85 @@ def list_raw_by_stem(folder):
             table[stem] = p
     return table
 
-# ---------------------------
-# 主流程
-# ---------------------------
-total_pairs = 0
-total_std_saves = 0
-total_patch_pairs = 0
+def load_std_rggb(path, meta, cfa, cam_tag):
+    with rawpy.imread(path) as raw:
+        data = raw.raw_image_visible.copy()
+    wl = float(meta['white_level']); bl = float(meta['black_level'])
+    raw_bayer_norm = np.clip((data.astype(np.float32) - bl) / max(wl - bl, 1.0), 0.0, 1.0)
+    rggb = pack_rggb(raw_bayer_norm, deepcopy(cfa))
+    rggb = apply_orient(rggb, ORIENT_PER_CAMERA.get(cam_tag, 'none'))
+    rggb_std = fit_cover_center_crop_downsample_only(rggb, TARGET_W, TARGET_H)
+    return rggb_std
 
-for _pair in pair_data:
-
-    def get_out_dirs(pair_tag, cam_tag):
-        if pair_tag == 'paired/':
-            out_rggb_dir = os.path.join(RESULT_DIR, 'paired', 'raw')
-            out_vis_dir  = os.path.join(RESULT_DIR, 'paired', 'jpg')
-        else:
-            out_rggb_dir = os.path.join(RESULT_DIR, pair_tag, cam_tag, 'raw-rggb')
-            out_vis_dir  = os.path.join(RESULT_DIR, pair_tag, cam_tag, 'vis')
-        return out_rggb_dir, out_vis_dir
-
-    if _pair != 'paired/':
-        print(f"\n[INFO] 处理 unpaired 分支：{_pair}")
-        for _cam in cameras:
-            postfix = postfix_map[_cam]
-            path_to_raw_data = os.path.join(BASE_DIR, _pair, _cam)
-            in_dir = os.path.join(path_to_raw_data, 'raw')
-            if not os.path.isdir(in_dir):
-                print(f'[WARN] Skip: directory not found: {in_dir}')
-                continue
-
-            out_rggb_dir, out_vis_dir = get_out_dirs(_pair, _cam)
-            check_dir(out_rggb_dir); check_dir(out_vis_dir)
-
-            all_raw_img_paths = [
-                os.path.join(in_dir, f) for f in os.listdir(in_dir)
-                if os.path.splitext(f)[1].lower() in RAW_EXTS
-            ]
-            all_raw_img_paths.sort()
-            print(f"[INFO] 相机 {_cam}：找到 {len(all_raw_img_paths)} 个 RAW")
-
-            meta_data = camera_meta[_cam]
-            pos_order = deepcopy(meta_data['cfa_pattern'])
-
-            for raw_img_path in all_raw_img_paths:
-                try:
-                    with rawpy.imread(raw_img_path) as raw:
-                        data = raw.raw_image_visible.copy()
-                except Exception as e:
-                    print(f'[ERROR] Failed to read: {raw_img_path} -> {e}')
-                    print(traceback.format_exc()); continue
-
-                if data.ndim != 2:
-                    print(f'[WARN] Not 2D Bayer, skipped: {raw_img_path} (shape={data.shape})')
-                    continue
-
-                wl = float(meta_data['white_level']); bl = float(meta_data['black_level'])
-                try:
-                    raw_bayer_norm = np.clip((data.astype(np.float32) - bl) / max(wl - bl, 1.0), 0.0, 1.0)
-                    raw_rggb = pack_rggb(raw_bayer_norm, deepcopy(pos_order))
-                    raw_rggb = apply_orient(raw_rggb, ORIENT_PER_CAMERA.get(_cam, 'none'))
-                    raw_rggb_std = fit_cover_center_crop_downsample_only(raw_rggb, tw=TARGET_W, th=TARGET_H)
-                except Exception as e:
-                    print(f"[ERROR] 标准化失败：{raw_img_path} -> {e}")
-                    print(traceback.format_exc()); continue
-
-                stem = os.path.splitext(os.path.basename(raw_img_path))[0]
-                try:
-                    savemat(os.path.join(out_rggb_dir, stem + postfix + '.mat'),
-                            {"raw_rggb": raw_rggb_std.astype(np.float32)})
-                    vis_lin = np.clip(from_rggb_to_rgb(raw_rggb_std), 0.0, 1.0)
-                    vis = (vis_lin * 0.9) ** (1 / 1.6)
-                    imwrite(os.path.join(out_vis_dir, stem + postfix + '.jpg'), np.nan_to_num(vis))
-                    total_std_saves += 1
-                except Exception as e:
-                    print(f"[ERROR] 保存失败（标准化或预览）：{stem}{postfix} -> {e}")
-                    print(traceback.format_exc()); continue
-
-                print(f"[OK] {stem}{postfix}")
-        continue
-
-    # ====== 'paired/'：配对+标准化+特征配对+裁剪保存 ======
-    print(f"\n[INFO] 处理 paired 分支：{_pair}")
-    camA, camB = cameras[0], cameras[1]  # 假定 ['huawei/','nikon/']
+# =========================
+# 处理一个相机对
+# =========================
+def process_one_pair(pair_name,
+                     stem_list,
+                     idx_by_cam,
+                     camA, camB,
+                     out_root_std_raw,
+                     out_root_std_jpg):
+    nameA, nameB = cam_tag_to_name(camA), cam_tag_to_name(camB)
     postfixA, postfixB = postfix_map[camA], postfix_map[camB]
-
-    baseA = os.path.join(BASE_DIR, 'paired', camA)
-    baseB = os.path.join(BASE_DIR, 'paired', camB)
-    idxA = list_raw_by_stem(baseA)
-    idxB = list_raw_by_stem(baseB)
-    common = sorted(set(idxA.keys()) & set(idxB.keys()))
-    print(f"[INFO] paired: {camA}={len(idxA)}; {camB}={len(idxB)}; common={len(common)}")
-
-    out_rggb_std_dir = os.path.join(RESULT_DIR, 'paired', 'raw')
-    out_vis_dir      = os.path.join(RESULT_DIR, 'paired', 'jpg')
-    out_match_dir    = os.path.join(RESULT_DIR, 'paired', 'matches')   # 新增：连线输出目录
-    out_patch_A = os.path.join(RESULT_DIR, 'paired', 'patches', 'rggb_A')
-    out_patch_B = os.path.join(RESULT_DIR, 'paired', 'patches', 'rggb_B')
-
-    # patch 可视化目录
-    out_patch_vis_A  = os.path.join(RESULT_DIR, 'paired', 'patches', 'vis_A')
-    out_patch_vis_B  = os.path.join(RESULT_DIR, 'paired', 'patches', 'vis_B')
-    out_patch_vis_AB = os.path.join(RESULT_DIR, 'paired', 'patches', 'vis_AB')
-
-    for d in [out_rggb_std_dir, out_vis_dir, out_match_dir,
-              out_patch_A, out_patch_B, out_patch_vis_A, out_patch_vis_B, out_patch_vis_AB]:
-        check_dir(d)
-
-    metaA = camera_meta[camA]; metaB = camera_meta[camB]
+    metaA, metaB = camera_meta[camA], camera_meta[camB]
     cfaA = deepcopy(metaA['cfa_pattern']); cfaB = deepcopy(metaB['cfa_pattern'])
 
-    def load_std_rggb(path, meta, cfa, cam_tag):
-        with rawpy.imread(path) as raw:
-            data = raw.raw_image_visible.copy()
-        wl = float(meta['white_level']); bl = float(meta['black_level'])
-        raw_bayer_norm = np.clip((data.astype(np.float32) - bl) / max(wl - bl, 1.0), 0.0, 1.0)
-        rggb = pack_rggb(raw_bayer_norm, deepcopy(cfa))
-        rggb = apply_orient(rggb, ORIENT_PER_CAMERA.get(cam_tag, 'none'))
-        rggb_std = fit_cover_center_crop_downsample_only(rggb, TARGET_W, TARGET_H)
-        return rggb_std
+    # 该相机对的输出
+    pair_root = os.path.join(RESULT_DIR, 'paired', f'{nameA}_{nameB}')
+    out_match_dir    = os.path.join(pair_root, 'matches')
+    out_patch_A      = os.path.join(pair_root, 'patches', f'rggb_{nameA}')
+    out_patch_B      = os.path.join(pair_root, 'patches', f'rggb_{nameB}')
+    out_patch_vis_A  = os.path.join(pair_root, 'patches', f'vis_{nameA}')
+    out_patch_vis_B  = os.path.join(pair_root, 'patches', f'vis_{nameB}')
+    out_patch_vis_AB = os.path.join(pair_root, 'patches', f'vis_{nameA}{postfixB}')
+    for d in [pair_root, out_match_dir, out_patch_A, out_patch_B, out_patch_vis_A, out_patch_vis_B, out_patch_vis_AB]:
+        check_dir(d)
 
-    for stem in common:
+    total_pairs = 0
+    total_patch_pairs = 0
+
+    for stem in stem_list:
         total_pairs += 1
-        pathA = idxA[stem]; pathB = idxB[stem]
-        print(f"\n[PAIR] {stem}")
+        pathA = idx_by_cam[camA][stem]
+        pathB = idx_by_cam[camB][stem]
+        print(f"\n[PAIR {pair_name}] {stem}")
+
+        # 读 & 标准化
         try:
             rggbA = load_std_rggb(pathA, metaA, cfaA, camA)
             rggbB = load_std_rggb(pathB, metaB, cfaB, camB)
         except Exception as e:
-            print(f"[ERROR] {stem}: 标准化失败 -> {e}")
+            print(f"[ERROR] {pair_name}:{stem}: 标准化失败 -> {e}")
             print(traceback.format_exc()); continue
 
-        # 保存整图（与原逻辑一致）
+        # 保存标准化整图（集中目录，供多对共享）
         try:
-            savemat(os.path.join(out_rggb_std_dir, stem + postfixA + '.mat'), {"raw_rggb": rggbA.astype(np.float32)})
-            savemat(os.path.join(out_rggb_std_dir, stem + postfixB + '.mat'), {"raw_rggb": rggbB.astype(np.float32)})
+            savemat(os.path.join(out_root_std_raw, stem + postfixA + '.mat'), {"raw_rggb": rggbA.astype(np.float32)})
+            savemat(os.path.join(out_root_std_raw, stem + postfixB + '.mat'), {"raw_rggb": rggbB.astype(np.float32)})
             visA = (np.clip(from_rggb_to_rgb(rggbA), 0.0, 1.0) * 0.9) ** (1/1.6)
             visB = (np.clip(from_rggb_to_rgb(rggbB), 0.0, 1.0) * 0.9) ** (1/1.6)
-            imwrite(os.path.join(out_vis_dir, stem + postfixA + '.jpg'), np.nan_to_num(visA))
-            imwrite(os.path.join(out_vis_dir, stem + postfixB + '.jpg'), np.nan_to_num(visB))
-            total_std_saves += 2
+            imwrite(os.path.join(out_root_std_jpg, stem + postfixA + '.jpg'), np.nan_to_num(visA))
+            imwrite(os.path.join(out_root_std_jpg, stem + postfixB + '.jpg'), np.nan_to_num(visB))
         except Exception as e:
-            print(f"[ERROR] {stem}: 保存整图失败 -> {e}")
-            print(traceback.format_exc())
-            # 不中断，继续匹配
+            print(f"[WARN] {pair_name}:{stem}: 保存整图失败 -> {e}")
 
-        # 特征配对（在统一化 RGB 上）
+        # 生成灰度并匹配
         try:
             rgbA01 = np.clip(from_rggb_to_rgb(rggbA), 0.0, 1.0)
             rgbB01 = np.clip(from_rggb_to_rgb(rggbB), 0.0, 1.0)
             grayA = cv2.cvtColor((rgbA01 * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
             grayB = cv2.cvtColor((rgbB01 * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
-        except Exception as e:
-            print(f"[ERROR] {stem}: 可视化/转灰失败 -> {e}")
-            print(traceback.format_exc()); continue
-
-        try:
             kpsA, kpsB, good, inliers = sift_flann_ransac(grayA, grayB,
                                                            nfeatures=SIFT_NFEATURES,
                                                            ratio=LOWE_RATIO,
                                                            ransac_reproj=RANSAC_REPROJ)
-            print(f"[INFO] {stem}: kpsA={len(kpsA)}, kpsB={len(kpsB)}, good={len(good)}, inliers={len(inliers)}")
+            print(f"[INFO] {pair_name}:{stem}: kpsA={len(kpsA)}, kpsB={len(kpsB)}, good={len(good)}, inliers={len(inliers)}")
         except Exception as e:
-            print(f"[ERROR] {stem}: 特征匹配失败 -> {e}")
+            print(f"[ERROR] {pair_name}:{stem}: 特征匹配失败 -> {e}")
             print(traceback.format_exc()); continue
 
-        # ---- 连线可视化（整图）----
+        # 连线可视化
         try:
             if len(good) > 0:
                 vis_ratio = draw_matches(rgbA01, rgbB01, kpsA, kpsB, good, inliers_only=False)
@@ -466,26 +348,24 @@ for _pair in pair_data:
                 vis_inl = draw_matches(rgbA01, rgbB01, kpsA, kpsB, inliers, inliers_only=True)
                 imwrite(os.path.join(out_match_dir, f"{stem}_inliers.png"), vis_inl)
         except Exception as e:
-            print(f"[ERROR] {stem}: 保存连线图失败 -> {e}")
-            print(traceback.format_exc())
+            print(f"[WARN] {pair_name}:{stem}: 保存连线图失败 -> {e}")
 
         if len(inliers) == 0:
-            print(f"[WARN] {stem}: 无 RANSAC 内点，跳过裁剪。")
+            print(f"[WARN] {pair_name}:{stem}: 无 RANSAC 内点，跳过裁剪。")
             continue
 
-        # NMS 去重
+        # NMS
         try:
-            inliers_sorted = sorted(inliers, key=lambda m: m.distance)
-            inliers_nms = nms_by_center_distance(kpsA, kpsB, inliers_sorted, min_dist=NMS_MIN_DIST)
-            print(f"[INFO] {stem}: NMS 后剩余 {len(inliers_nms)}")
+            inliers_nms = nms_by_center_distance(kpsA, kpsB, inliers, min_dist=NMS_MIN_DIST)
+            print(f"[INFO] {pair_name}:{stem}: NMS 后剩余 {len(inliers_nms)}")
             if len(inliers_nms) == 0:
-                print(f"[WARN] {stem}: NMS 后无匹配点，跳过裁剪。")
+                print(f"[WARN] {pair_name}:{stem}: NMS 后无匹配点，跳过裁剪。")
                 continue
         except Exception as e:
-            print(f"[ERROR] {stem}: NMS 失败 -> {e}")
+            print(f"[ERROR] {pair_name}:{stem}: NMS 失败 -> {e}")
             print(traceback.format_exc()); continue
 
-        # 裁剪 256×256（越界则对两图同步平移补齐）
+        # 裁剪+保存
         saved = 0
         for i, m in enumerate(inliers_nms):
             xA, yA = kpsA[m.queryIdx].pt
@@ -493,52 +373,85 @@ for _pair in pair_data:
             try:
                 patchA, patchB = crop_pair_shift_sync(rggbA, xA, yA, rggbB, xB, yB, size=PATCH_RGGB)
             except Exception as e:
-                print(f"[WARN] {stem}: 第 {i} 个内点裁剪失败，原因：{e}")
+                print(f"[WARN] {pair_name}:{stem}: 第 {i} 个内点裁剪失败：{e}")
                 continue
-
-            # 1) 保存 RGGB patch
             try:
-                pathA_mat = os.path.join(out_patch_A, f"{stem}_p{i:04d}{postfixA}.mat")
-                pathB_mat = os.path.join(out_patch_B, f"{stem}_p{i:04d}{postfixB}.mat")
-                savemat(pathA_mat, {"raw_rggb": patchA.astype(np.float32)})
-                savemat(pathB_mat, {"raw_rggb": patchB.astype(np.float32)})
-            except Exception as e:
-                print(f"[ERROR] {stem}: 保存 patch MAT 失败（idx={i}）-> {e}")
-                print(traceback.format_exc()); continue
-
-            # 2) 保存 patch 可视化（A/B/AB）
-            try:
+                savemat(os.path.join(out_patch_A, f"{stem}_p{i:04d}{postfixA}.mat"),
+                        {"raw_rggb": patchA.astype(np.float32)})
+                savemat(os.path.join(out_patch_B, f"{stem}_p{i:04d}{postfixB}.mat"),
+                        {"raw_rggb": patchB.astype(np.float32)})
                 visA_p = (np.clip(from_rggb_to_rgb(patchA), 0.0, 1.0) * 0.9) ** (1/1.6)
                 visB_p = (np.clip(from_rggb_to_rgb(patchB), 0.0, 1.0) * 0.9) ** (1/1.6)
-                outA_vis = os.path.join(out_patch_vis_A,  f"{stem}_p{i:04d}{postfixA}.png")
-                outB_vis = os.path.join(out_patch_vis_B,  f"{stem}_p{i:04d}{postfixB}.png")
-                outAB_vis= os.path.join(out_patch_vis_AB, f"{stem}_p{i:04d}{postfixA}{postfixB}.png")
-                imwrite(outA_vis, np.nan_to_num(visA_p))
-                imwrite(outB_vis, np.nan_to_num(visB_p))
-                side = np.concatenate([visA_p, visB_p], axis=1)
-                imwrite(outAB_vis, np.nan_to_num(side))
+                imwrite(os.path.join(out_patch_vis_A,  f"{stem}_p{i:04d}{postfixA}.png"), np.nan_to_num(visA_p))
+                imwrite(os.path.join(out_patch_vis_B,  f"{stem}_p{i:04d}{postfixB}.png"), np.nan_to_num(visB_p))
+                imwrite(os.path.join(out_patch_vis_AB, f"{stem}_p{i:04d}{postfixA}{postfixB}.png"),
+                        np.nan_to_num(np.concatenate([visA_p, visB_p], axis=1)))
             except Exception as e:
-                print(f"[ERROR] {stem}: 保存 patch 可视化失败（idx={i}）-> {e}")
-                print(traceback.format_exc())
-
+                print(f"[ERROR] {pair_name}:{stem}: 保存 patch 失败（idx={i}）-> {e}")
+                print(traceback.format_exc()); continue
             saved += 1
 
         total_patch_pairs += saved
         if saved == 0:
-            print(f"[WARN] {stem}: 本对样本未成功保存任何 256×256 RGGB patch。")
+            print(f"[WARN] {pair_name}:{stem}: 未成功保存任何 {PATCH_RGGB}×{PATCH_RGGB} patch。")
         else:
-            print(f"[OK] {stem}: 成功保存 256×256 RGGB patch 对数 = {saved}")
+            print(f"[OK] {pair_name}:{stem}: 成功保存 patch 对数 = {saved}")
 
-# ---------------------------
-# 汇总
-# ---------------------------
-print("\n========== 处理汇总 ==========")
-print(f"[SUM] 处理的同名配对对数：{total_pairs}")
-print(f"[SUM] 保存的整图（标准化RGGB/JPG）文件数：{total_std_saves}")
-print(f"[SUM] 保存的 256×256 RGGB patch 对数：{total_patch_pairs}")
-if total_pairs == 0:
-    print("[HINT] 未找到任何同名配对：检查 BASE_DIR/paired/{huawei,nikon}/raw 下是否存在同名 stem 的 RAW 文件。")
-if total_std_saves == 0:
-    print("[HINT] 没有保存任何标准化输出：检查读 RAW 是否报错（权限/路径/损坏），或图像尺寸是否小于 2000×1500。")
-if total_patch_pairs == 0:
-    print("[HINT] 没有任何 patch：可能因无 RANSAC 内点、NMS 后为空、或裁剪越界。可尝试：提高 LOWE_RATIO、增大 RANSAC_REPROJ、调小 NMS_MIN_DIST。")
+    return total_pairs, total_patch_pairs
+
+# =========================
+# 主流程
+# =========================
+def main():
+    # 公共输出（标准化整图共享）
+    out_rggb_std_dir = os.path.join(RESULT_DIR, 'paired', 'std_raw')
+    out_vis_dir      = os.path.join(RESULT_DIR, 'paired', 'std_jpg')
+    for d in [out_rggb_std_dir, out_vis_dir]:
+        check_dir(d)
+
+    # 每个相机建立索引
+    idx_by_cam = {}
+    for cam in cameras:
+        base = os.path.join(BASE_DIR, 'paired', cam)
+        idx_by_cam[cam] = list_raw_by_stem(base)
+        print(f"[INFO] {cam}: found {len(idx_by_cam[cam])} raws")
+
+    cam_pairs = list(combinations(cameras, 2))
+    if not cam_pairs:
+        print("[ERROR] cameras 列表中不足 2 个域。")
+        return
+
+    grand_pairs = 0
+    grand_patches = 0
+
+    for camA, camB in cam_pairs:
+        nameA, nameB = cam_tag_to_name(camA), cam_tag_to_name(camB)
+        pair_name = f"{nameA}_{nameB}"
+        common_stems = sorted(set(idx_by_cam[camA].keys()) & set(idx_by_cam[camB].keys()))
+        print(f"\n========== [{pair_name}] common stems = {len(common_stems)} ==========")
+        if len(common_stems) == 0:
+            print(f"[WARN] {pair_name}: 无同名 stem，跳过。")
+            continue
+
+        total_pairs, total_patch_pairs = process_one_pair(
+            pair_name=pair_name,
+            stem_list=common_stems,
+            idx_by_cam=idx_by_cam,
+            camA=camA, camB=camB,
+            out_root_std_raw=out_rggb_std_dir,
+            out_root_std_jpg=out_vis_dir
+        )
+        print(f"[SUM] {pair_name}: 处理对数={total_pairs}, 保存 patch 对数={total_patch_pairs}")
+        grand_pairs += total_pairs
+        grand_patches += total_patch_pairs
+
+    print("\n========== 全部相机对汇总 ==========")
+    print(f"[SUM] 总计处理的相机对内样本数（sum over pairs）：{grand_pairs}")
+    print(f"[SUM] 总计保存的 {PATCH_RGGB}×{PATCH_RGGB} RGGB patch 对数：{grand_patches}")
+    if grand_pairs == 0:
+        print("[HINT] 没有 pair 被处理：请检查 cameras 列表与 raw 目录的同名文件。")
+    if grand_patches == 0:
+        print("[HINT] 没有 patch：可能因无内点、NMS 后为空、或裁剪越界。可尝试提高 LOWE_RATIO、增大 RANSAC_REPROJ、调小 NMS_MIN_DIST。")
+
+if __name__ == "__main__":
+    main()

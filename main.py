@@ -13,7 +13,6 @@ import wandb
 
 
 FIXINPUT={
-    'iphone': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',],
     'samsung': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',],
     'huawei': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',],
     'nikon': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',]
@@ -104,7 +103,7 @@ if __name__ == '__main__':
     # model arguments
     parser.add_argument('--img_size', type=int, default=256,
                         help='Image resolution')
-    parser.add_argument('--num_domains', type=int, default=4,
+    parser.add_argument('--num_domains', type=int, default=3,
                         help='Number of domains')
     parser.add_argument('--style_dim', type=int, default=64,
                         help='Style code dimension')
@@ -165,13 +164,13 @@ if __name__ == '__main__':
                         help='Directory containing validation images')
     parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/r2r-odb/processed/unpaired',
                         help='Directory for saving generated images')
-    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/out_db/expr/checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/out_db_3/expr/checkpoints',
                         help='Directory for saving network checkpoints')
     parser.add_argument('--noise_profile_paths', type=str,
-                        default='./preprocess/noise_profiles/iphone_profile.pt,./preprocess/noise_profiles/samsung_profile.pt,./preprocess/noise_profiles/huawei_profile.pt,./preprocess/noise_profiles/nikon_profile.pt')
+                        default='./preprocess/noise_profiles/samsung_profile.pt,./preprocess/noise_profiles/huawei_profile.pt,./preprocess/noise_profiles/nikon_profile.pt')
 
     # directory for testing
-    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/out_db/expr/results',
+    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/out_db_3/expr/results',
                         help='Directory for saving generated images and videos')
 
     # step size

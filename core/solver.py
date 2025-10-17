@@ -282,6 +282,12 @@ class Solver(nn.Module):
         domain2idx = {d: i for i, d in enumerate(domains)}  # {iphone:0}
         pairs = [(s, t) for s in domains for t in domains if s != t]
 
+        trip_dir = os.path.join(self.args.result_dir, "triptychs")
+        fake_root = os.path.join(self.args.result_dir, "fakes_by_target")
+        os.makedirs(trip_dir, exist_ok=True)
+        for d in domains:
+            os.makedirs(os.path.join(fake_root, d), exist_ok=True)
+
         tot = {
             f"{s}->{t}": {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
             for s, t in pairs
@@ -340,8 +346,8 @@ class Solver(nn.Module):
 
                 s_t = self.style_encoder_ema(x_tgt, y_tgt)
                 x_fake = self.generator_ema(x_src, s_t, y_org=y_src, c_t=y_tgt)
-                x_fake_den = self.denorm(x_fake)   # [0,1]
-                x_tgt_den = self.denorm(x_tgt)     # [0,1]
+                x_fake_den = self.denorm(x_fake)  # [0,1]
+                x_tgt_den = self.denorm(x_tgt)  # [0,1]
 
                 mae = torch.abs(x_fake_den - x_tgt_den).view(B, -1).mean(dim=1).sum().item()
                 psnr = _psnr(x_fake_den, x_tgt_den).sum().item()
@@ -357,15 +363,20 @@ class Solver(nn.Module):
                 tot[key]["count"] += B
 
                 if not self.args.use_wandb:
-                    trip = torch.stack([
-                        self.rggb2rgb(self.denorm(x_src)[0]),
-                        self.rggb2rgb(x_fake_den[0]),
-                        self.rggb2rgb(x_tgt_den[0])
-                    ], dim=0)
+                    src_rgb = self.rggb2rgb(self.denorm(x_src)[0])
+                    fake_rgb = self.rggb2rgb(x_fake_den[0])
+                    tgt_rgb = self.rggb2rgb(x_tgt_den[0])
+
+                    trip = torch.stack([src_rgb, fake_rgb, tgt_rgb], dim=0)
                     save_image(
                         trip,
-                        f"{self.args.result_dir}/{src}2{tgt}_batch{batch_i}.png",
+                        os.path.join(trip_dir, f"{src}2{tgt}_batch{batch_i}.png"),
                         nrow=3
+                    )
+
+                    save_image(
+                        fake_rgb,
+                        os.path.join(fake_root, tgt, f"{src}2{tgt}_batch{batch_i}_fake.png")
                     )
 
         # print per–pair metrics

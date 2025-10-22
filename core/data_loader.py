@@ -260,3 +260,54 @@ class InputFetcher:
 
         return Munch({k: v.to(self.device)
                       for k, v in inputs.items()})
+
+def build_train_ref_pool(root: str):
+    """
+    构建参考池（reference pool）：
+    返回 domains(list[str]) 与 pool(dict[str, list[str]])。
+    每个域对应该域下所有 .npy 文件的绝对路径。
+    """
+    root_p = Path(root)
+    domains = sorted([p.name for p in root_p.iterdir() if p.is_dir()])
+    pool = {}
+    for d in domains:
+        ddir = root_p / d
+        paths = sorted(str(p.resolve()) for p in ddir.rglob('*.npy'))
+        pool[d] = paths
+    return domains, pool
+
+
+def sample_k_from_pool(pool: dict, domains: list, y: torch.Tensor, K: int,
+                       transform, device: torch.device):
+    """
+    从池中按域抽取 K 张参考（per-sample），并应用给定 transform。
+    输入：
+      - pool: {domain -> [paths]}
+      - domains: 与 y 的索引一致的域名列表
+      - y: [B]，域索引（long）
+      - K: 每个样本抽 K 张
+      - transform: 与训练/评测一致的 transform（Compose）
+      - device: 目标设备
+    输出：
+      - x_ref: [B, K, 4, H, W]（float, 已 transform, 在 device）
+    """
+    B = y.shape[0]
+    out = []
+    for b in range(B):
+        dname = domains[int(y[b].item())]
+        paths = pool.get(dname, [])
+        if not paths:
+            raise RuntimeError(f"No ref paths for domain={dname}")
+        # 随机选择 K 条路径（可重复抽样）
+        idxs = torch.randint(low=0, high=len(paths), size=(K,))
+        imgs = []
+        for j in idxs.tolist():
+            arr = np.load(paths[j])
+            img = torch.from_numpy(arr).float()
+            if transform is not None:
+                img = transform(img)
+            imgs.append(img)
+        xk = torch.stack(imgs, dim=0)  # [K,4,H,W]
+        out.append(xk)
+    x_ref = torch.stack(out, dim=0).to(device)  # [B,K,4,H,W]
+    return x_ref

@@ -21,12 +21,13 @@ from pytorch_msssim import SSIM
 
 from core.model import build_model
 from core.checkpoint import CheckpointIO
-from core.data_loader import InputFetcher
+from core.data_loader import InputFetcher, sample_k_from_pool, build_train_ref_pool
 import core.utils as utils
 from tqdm import tqdm
 from torchvision.utils import save_image
 
 import wandb
+from torchvision import transforms
 
 class Solver(nn.Module):
     def __init__(self, args):
@@ -92,6 +93,14 @@ class Solver(nn.Module):
             if 'ema' not in name:
                 print('Initializing %s...' % name)
                 network.apply(utils.he_init)
+
+        self.train_domains, self.train_ref_pool = build_train_ref_pool(self.args.train_img_dir)
+
+        self.ref_transform = transforms.Compose([
+            transforms.Resize([self.args.img_size, self.args.img_size]),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
+                                 std=[0.5, 0.5, 0.5, 0.5]),
+        ])
 
     def _save_checkpoint(self, step):
         for ckptio in self.ckptios:
@@ -161,10 +170,20 @@ class Solver(nn.Module):
             d_loss.backward()
             optims.discriminator.step()
 
+            x_org_rand = sample_k_from_pool(
+                pool=self.train_ref_pool,
+                domains=self.train_domains,
+                y=y_org,  # [B]
+                K=1,  # K-shot
+                transform=self.ref_transform,
+                device=self.device
+            ).squeeze(1)
+
             g_loss, g_losses_ref = compute_g_loss(
                 nets, args, x_real, y_org, y_trg, x_refs=[x_ref, x_ref2],
                 noise_loss_fn=self._noise_loss_batch,
-                ssim_fn=getattr(self, 'ssim_train', None)  # SSIM on [-1,1]
+                ssim_fn=getattr(self, 'ssim_train', None),  # SSIM on [-1,1],
+                x_org_rand=x_org_rand
             )
             self._reset_grad()
             g_loss.backward()
@@ -269,6 +288,7 @@ class Solver(nn.Module):
 
     @torch.no_grad()
     def test(self, step=None):
+        from itertools import combinations
         if step is None:
             step = self.args.resume_iter
 
@@ -277,22 +297,22 @@ class Solver(nn.Module):
         self.style_encoder_ema.eval()
 
         os.makedirs(self.args.result_dir, exist_ok=True)
-
-        domains = sorted(os.listdir(self.args.val_img_dir))
-        domain2idx = {d: i for i, d in enumerate(domains)}  # {iphone:0}
-        pairs = [(s, t) for s in domains for t in domains if s != t]
-
         trip_dir = os.path.join(self.args.result_dir, "triptychs")
         fake_root = os.path.join(self.args.result_dir, "fakes_by_target")
         os.makedirs(trip_dir, exist_ok=True)
-        for d in domains:
-            os.makedirs(os.path.join(fake_root, d), exist_ok=True)
+        os.makedirs(fake_root, exist_ok=True)
 
-        tot = {
-            f"{s}->{t}": {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
-            for s, t in pairs
-        }
-        tot_imgs = 0
+        domains = sorted(
+            d for d in os.listdir(self.args.val_img_dir)
+            if os.path.isdir(os.path.join(self.args.val_img_dir, d))
+        )
+        domain2idx = {d: i for i, d in enumerate(domains)}
+
+
+        pairs = list(combinations(domains, 2))  # [('iphone-x','samsung-s9'), ...]
+
+        K = int(getattr(self.args, "test_kshot", 4))
+        K = max(1, K)
 
         def _psnr(x, y, max_val=1.0, eps=1e-10):
             mse = ((x - y) ** 2).mean(dim=[1, 2, 3])
@@ -329,91 +349,142 @@ class Solver(nn.Module):
         ssim_fn = SSIM(data_range=1.0, channel=4, size_average=False).to(self.device)
         kl_bins = int(getattr(self.args, 'kl_bins', 256))
 
-        for batch_i, (imgs_dict, filenames) in enumerate(
-                tqdm(self.test_loader, desc="Testing")):
-            B = next(iter(imgs_dict.values())).size(0)
-            tot_imgs += B
+        tot = {}
+        for a, b in pairs:
+            tot[f"{a}->{b}"] = {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
+            tot[f"{b}->{a}"] = {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
 
+        for batch_i, (imgs_dict, _) in enumerate(tqdm(self.test_loader, desc="Testing")):
             for d in domains:
                 imgs_dict[d] = imgs_dict[d].to(self.device)
+
+            B = next(iter(imgs_dict.values())).size(0)
+            if B <= 1:
+                continue
 
             for src, tgt in pairs:
                 x_src = imgs_dict[src]
                 x_tgt = imgs_dict[tgt]
 
-                y_tgt = torch.full((B,), domain2idx[tgt], device=self.device, dtype=torch.long)
                 y_src = torch.full((B,), domain2idx[src], device=self.device, dtype=torch.long)
+                y_tgt = torch.full((B,), domain2idx[tgt], device=self.device, dtype=torch.long)
 
-                s_t = self.style_encoder_ema(x_tgt, y_tgt)
+                # ---------- forward: src -> tgt（同 batch K-shot，避开自身） ----------
+                idx_all = torch.arange(B, device=self.device)
+                idx_matrix = []
+                for b in range(B):
+                    cand = torch.cat([idx_all[:b], idx_all[b+1:]])  # 长度 B-1
+                    if K <= cand.numel():
+                        perm = cand[torch.randperm(cand.numel(), device=self.device)[:K]]
+                    else:
+                        take = cand[torch.randperm(cand.numel(), device=self.device)]
+                        extra = cand[torch.randint(0, cand.numel(), (K - cand.numel(),), device=self.device)]
+                        perm = torch.cat([take, extra], dim=0)
+                    idx_matrix.append(perm)
+                idx_matrix = torch.stack(idx_matrix, dim=0)          # [B,K]
+
+                x_ref_tgt = x_tgt[idx_matrix]                         # [B,K,4,H,W]
+                x_ref_flat = x_ref_tgt.view(B * K, 4, x_tgt.size(2), x_tgt.size(3))
+                y_tgt_flat = y_tgt.view(B, 1).expand(B, K).reshape(B * K)
+
+                s_all = self.style_encoder_ema(x_ref_flat, y_tgt_flat).view(B, K, -1)  # [B,K,S]
+                s_t = s_all.mean(dim=1)                                                # [B,S]（如需更鲁棒可换 median）
+
                 x_fake = self.generator_ema(x_src, s_t, y_org=y_src, c_t=y_tgt)
-                x_fake_den = self.denorm(x_fake)  # [0,1]
-                x_tgt_den = self.denorm(x_tgt)  # [0,1]
 
-                mae = torch.abs(x_fake_den - x_tgt_den).view(B, -1).mean(dim=1).sum().item()
-                psnr = _psnr(x_fake_den, x_tgt_den).sum().item()
-                ssim = ssim_fn(x_fake_den, x_tgt_den).sum().item()
-                kl_vals = _sym_kl_hist(x_fake_den, x_tgt_den, bins=kl_bins)
-                kl_sum = kl_vals.sum().item()
+                x_fake_den = self.denorm(x_fake)
+                x_tgt_den  = self.denorm(x_tgt)
 
-                key = f"{src}->{tgt}"
-                tot[key]["mae"] += mae
-                tot[key]["psnr"] += psnr
-                tot[key]["ssim"] += ssim
-                tot[key]["kl"] += kl_sum
-                tot[key]["count"] += B
+                mae_f  = torch.abs(x_fake_den - x_tgt_den).view(B, -1).mean(dim=1).sum().item()
+                psnr_f = _psnr(x_fake_den, x_tgt_den).sum().item()
+                ssim_f = ssim_fn(x_fake_den, x_tgt_den).sum().item()
+                kl_f   = _sym_kl_hist(x_fake_den, x_tgt_den, bins=kl_bins).sum().item()
+
+                key_fwd = f"{src}->{tgt}"
+                tot[key_fwd]["mae"]   += mae_f
+                tot[key_fwd]["psnr"]  += psnr_f
+                tot[key_fwd]["ssim"]  += ssim_f
+                tot[key_fwd]["kl"]    += kl_f
+                tot[key_fwd]["count"] += B
 
                 if not self.args.use_wandb:
-                    src_rgb = self.rggb2rgb(self.denorm(x_src)[0])
+                    src_rgb  = self.rggb2rgb(self.denorm(x_src)[0])
                     fake_rgb = self.rggb2rgb(x_fake_den[0])
-                    tgt_rgb = self.rggb2rgb(x_tgt_den[0])
+                    tgt_rgb  = self.rggb2rgb(x_tgt_den[0])
+                    save_image(torch.stack([src_rgb, fake_rgb, tgt_rgb], 0),
+                            os.path.join(trip_dir, f"{src}2{tgt}_batch{batch_i}.png"),
+                            nrow=3)
+                    os.makedirs(os.path.join(fake_root, tgt), exist_ok=True)
+                    save_image(fake_rgb,
+                            os.path.join(fake_root, tgt, f"{src}2{tgt}_batch{batch_i}_fake.png"))
 
-                    trip = torch.stack([src_rgb, fake_rgb, tgt_rgb], dim=0)
-                    save_image(
-                        trip,
-                        os.path.join(trip_dir, f"{src}2{tgt}_batch{batch_i}.png"),
-                        nrow=3
-                    )
+                # ---------- reverse: tgt -> src（同 batch K-shot，避开自身） ----------
+                idx_matrix = []
+                for b in range(B):
+                    cand = torch.cat([idx_all[:b], idx_all[b+1:]])
+                    if K <= cand.numel():
+                        perm = cand[torch.randperm(cand.numel(), device=self.device)[:K]]
+                    else:
+                        take = cand[torch.randperm(cand.numel(), device=self.device)]
+                        extra = cand[torch.randint(0, cand.numel(), (K - cand.numel(),), device=self.device)]
+                        perm = torch.cat([take, extra], dim=0)
+                    idx_matrix.append(perm)
+                idx_matrix = torch.stack(idx_matrix, dim=0)          # [B,K]
 
-                    save_image(
-                        fake_rgb,
-                        os.path.join(fake_root, tgt, f"{src}2{tgt}_batch{batch_i}_fake.png")
-                    )
+                x_ref_src = x_src[idx_matrix]                         # [B,K,4,H,W]
+                x_ref_flat = x_ref_src.view(B * K, 4, x_src.size(2), x_src.size(3))
+                y_src_flat = y_src.view(B, 1).expand(B, K).reshape(B * K)
 
-        # print per–pair metrics
+                s_all = self.style_encoder_ema(x_ref_flat, y_src_flat).view(B, K, -1)
+                s_s = s_all.mean(dim=1)                                                # [B,S]
+
+                x_fake_rev = self.generator_ema(x_tgt, s_s, y_org=y_tgt, c_t=y_src)
+
+                x_fake_rev_den = self.denorm(x_fake_rev)
+                x_src_den = self.denorm(x_src)
+
+                mae_r  = torch.abs(x_fake_rev_den - x_src_den).view(B, -1).mean(dim=1).sum().item()
+                psnr_r = _psnr(x_fake_rev_den, x_src_den).sum().item()
+                ssim_r = ssim_fn(x_fake_rev_den, x_src_den).sum().item()
+                kl_r   = _sym_kl_hist(x_fake_rev_den, x_src_den, bins=kl_bins).sum().item()
+
+                key_rev = f"{tgt}->{src}"
+                tot[key_rev]["mae"]   += mae_r
+                tot[key_rev]["psnr"]  += psnr_r
+                tot[key_rev]["ssim"]  += ssim_r
+                tot[key_rev]["kl"]    += kl_r
+                tot[key_rev]["count"] += B
+
         for key, v in tot.items():
-            cnt = v["count"]
-            print(f"{key}  MAE:{v['mae'] / cnt:.4f} "
-                  f"PSNR:{v['psnr'] / cnt:.2f} "
-                  f"SSIM:{v['ssim'] / cnt:.4f} "
-                  f"KL:{v['kl'] / cnt:.6f}")
+            cnt = max(1, v["count"])
+            print(f"{key}  MAE:{v['mae']/cnt:.4f} PSNR:{v['psnr']/cnt:.2f} "
+                f"SSIM:{v['ssim']/cnt:.4f} KL:{v['kl']/cnt:.6f}")
 
-        # overall micro-average across all pairs
-        total_mae = sum(v["mae"] for v in tot.values())
+        # 微平均
+        total_mae  = sum(v["mae"]  for v in tot.values())
         total_psnr = sum(v["psnr"] for v in tot.values())
         total_ssim = sum(v["ssim"] for v in tot.values())
-        total_kl = sum(v["kl"] for v in tot.values())
-        total_count = sum(v["count"] for v in tot.values())
+        total_kl   = sum(v["kl"]   for v in tot.values())
+        total_cnt  = sum(v["count"] for v in tot.values())
 
-        avg_mae = total_mae / total_count
-        avg_psnr = total_psnr / total_count
-        avg_ssim = total_ssim / total_count
-        avg_kl = total_kl / total_count
+        avg_mae  = total_mae / total_cnt if total_cnt > 0 else float('nan')
+        avg_psnr = total_psnr / total_cnt if total_cnt > 0 else float('nan')
+        avg_ssim = total_ssim / total_cnt if total_cnt > 0 else float('nan')
+        avg_kl   = total_kl   / total_cnt if total_cnt > 0 else float('nan')
 
-        print(f"Avg all  MAE:{avg_mae:.4f} "
-              f"PSNR:{avg_psnr:.2f} "
-              f"SSIM:{avg_ssim:.4f} "
-              f"KL:{avg_kl:.6f}")
+        print(f"Avg all  MAE:{avg_mae:.4f} PSNR:{avg_psnr:.2f} SSIM:{avg_ssim:.4f} KL:{avg_kl:.6f}")
 
         # -- WandB logging of evaluation metrics --
         if self.args.use_wandb:
             metrics = {}
             for key, v in tot.items():
                 cnt = v["count"]
+                if cnt == 0:
+                    continue
                 metrics[f"{key}/MAE"] = v["mae"] / cnt
                 metrics[f"{key}/PSNR"] = v["psnr"] / cnt
                 metrics[f"{key}/SSIM"] = v["ssim"] / cnt
                 metrics[f"{key}/KL"] = v["kl"] / cnt
-            # also log the micro-averages
             metrics["Avg/MAE"] = avg_mae
             metrics["Avg/PSNR"] = avg_psnr
             metrics["Avg/SSIM"] = avg_ssim
@@ -441,7 +512,7 @@ def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref):
                        fake=loss_fake.item(),
                        reg=loss_reg.item())
 
-def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None, ssim_fn=None):
+def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None, ssim_fn=None, x_org_rand=None):
     x_ref, x_ref2 = x_refs
 
     # adversarial loss
@@ -449,6 +520,8 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None,
     x_fake = nets.generator(x_real, s_trg, y_org=y_org, c_t=y_trg)
     out = nets.discriminator(x_fake, y_trg)
     loss_adv = adv_loss(out, 1)
+
+    loss_edge = edge_aware_loss(x_fake, x_real)
 
     # style reconstruction loss
     s_pred = nets.style_encoder(x_fake, y_trg)
@@ -494,7 +567,8 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None,
             + getattr(args, 'lambda_noise', 0.0) * loss_noise
             + lambda_id * loss_id
             + getattr(args, 'lambda_cyc_ssim', 0.0) * loss_cyc_ssim
-            + getattr(args, 'lambda_id_ssim', 0.0) * loss_id_ssim)
+            + getattr(args, 'lambda_id_ssim', 0.0) * loss_id_ssim
+            + args.lambda_edge * loss_edge )
 
     return loss, Munch(
         adv=loss_adv.item(),
@@ -504,7 +578,8 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None,
         noise=loss_noise.item(),
         id=loss_id.item(),
         cyc_ssim=(loss_cyc_ssim.item() if torch.is_tensor(loss_cyc_ssim) else 0.0),
-        id_ssim=(loss_id_ssim.item() if torch.is_tensor(loss_id_ssim) else 0.0)
+        id_ssim=(loss_id_ssim.item() if torch.is_tensor(loss_id_ssim) else 0.0),
+        edge_loss=loss_edge
     )
 
 def moving_average(model, model_test, beta=0.999):
@@ -530,6 +605,21 @@ def r1_reg(d_out, x_in):
     reg = 0.5 * grad_dout2.view(batch_size, -1).sum(1).mean(0)
     return reg
 
+def edge_aware_loss(pred, target):
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                           dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                           dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
+
+    pred_edges_x = F.conv2d(pred, sobel_x.repeat(4, 1, 1, 1), padding=1, groups=4)
+    pred_edges_y = F.conv2d(pred, sobel_y.repeat(4, 1, 1, 1), padding=1, groups=4)
+    pred_edges = torch.sqrt(pred_edges_x ** 2 + pred_edges_y ** 2)
+
+    target_edges_x = F.conv2d(target, sobel_x.repeat(4, 1, 1, 1), padding=1, groups=4)
+    target_edges_y = F.conv2d(target, sobel_y.repeat(4, 1, 1, 1), padding=1, groups=4)
+    target_edges = torch.sqrt(target_edges_x ** 2 + target_edges_y ** 2)
+
+    return F.l1_loss(pred_edges, target_edges)
 
 class NoiseHistogramLoss(nn.Module):
     def __init__(self, profile_path, patch_size=16, stride=None, keep_ratio=None, use_mad=True, device='cuda', eps=1e-8):

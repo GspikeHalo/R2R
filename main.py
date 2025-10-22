@@ -11,17 +11,22 @@ from pathlib import Path
 
 import wandb
 
+# FIXINPUT={
+#     'huawei': ['139.npy', '661.npy', '2091.npy','1920.npy','3209.npy','3513.npy','3797.npy','3609.npy'],
+#     'nikon': ['139.npy', '661.npy', '2091.npy','1920.npy','3209.npy','3513.npy','3797.npy','3609.npy'],
+# }
+# FIXINPUT={
+#     'iphone': ['74.npy', '151.npy', '268.npy','389.npy','541.npy','2565.npy','3634.npy',],
+#     'samsung': ['66.npy', '124.npy', '205.npy','408.npy','857.npy','1024.npy','2058.npy',],
+#     'huawei': ['139.npy', '661.npy', '2091.npy','1920.npy','3209.npy','3513.npy','3797.npy'],
+#     'nikon': ['139.npy', '661.npy', '2091.npy','1920.npy','3209.npy','3513.npy','3797.npy'],
+#     'canon': ['51.npy', '79.npy', '329.npy','757.npy','1205.npy','1455.npy','1541.npy',]
+# }
 
 FIXINPUT={
-    'samsung': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',],
-    'huawei': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',],
-    'nikon': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',]
+    'iphone-x': ['3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy'],
+    'samsung-s9': [ '3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy']
 }
-
-# FIXINPUT={
-#     'iphone-x': ['3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy'],
-#     'samsung-s9': [ '3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy']
-# }
 
 # FIXINPUT={
 #     'iphone-x': ['3054.npy', '5889.npy', '2285.npy', '3574.npy', '2798.npy', '6143.npy', '2540.npy', '4346.npy',
@@ -54,7 +59,7 @@ def main(args):
             project='StarGAN-R2R',
             entity='bias-lab',
             config=vars(args),
-            name="our_db"
+            name="r2r-final"
         )
 
     solver = Solver(args)
@@ -96,6 +101,12 @@ def main(args):
     if args.use_wandb:
         wandb.finish()
 
+    else:
+        raise NotImplementedError
+
+    if args.use_wandb:
+        wandb.finish()
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -103,7 +114,7 @@ if __name__ == '__main__':
     # model arguments
     parser.add_argument('--img_size', type=int, default=256,
                         help='Image resolution')
-    parser.add_argument('--num_domains', type=int, default=3,
+    parser.add_argument('--num_domains', type=int, default=2,
                         help='Number of domains')
     parser.add_argument('--style_dim', type=int, default=64,
                         help='Style code dimension')
@@ -121,8 +132,12 @@ if __name__ == '__main__':
                         help='Weight for noise consistency loss')
     parser.add_argument('--lambda_id', type=float, default=1.0,
                         help='Weight for id identity loss')
+    parser.add_argument('--lambda_sty_org', type=float, default=1.0)
+
     parser.add_argument('--lambda_cyc_ssim', type=float, default=0.1)
     parser.add_argument('--lambda_id_ssim', type=float, default=0.05)
+    parser.add_argument('--lambda_edge', type=float, default=0.1)
+
     parser.add_argument('--ds_iter', type=int, default=100000,
                         help='Number of iterations to optimize diversity sensitive loss')
 
@@ -158,19 +173,19 @@ if __name__ == '__main__':
                         help='Seed for random number generator')
 
     # directory for training
-    parser.add_argument('--train_img_dir', type=str, default='/media/Data_2/R2RResult/r2r-odb/processed/unpaired',
+    parser.add_argument('--train_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
                         help='Directory containing training images')
-    parser.add_argument('--val_img_dir', type=str, default='/media/Data_2/R2RResult/r2r-odb/processed/test',
+    parser.add_argument('--val_img_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/test',
                         help='Directory containing validation images')
-    parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/r2r-odb/processed/unpaired',
+    parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/processed/starganV2/train',
                         help='Directory for saving generated images')
-    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/out_db_3/expr/checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-best-v1/expr/checkpoints',
                         help='Directory for saving network checkpoints')
     parser.add_argument('--noise_profile_paths', type=str,
-                        default='./preprocess/noise_profiles/samsung_profile.pt,./preprocess/noise_profiles/huawei_profile.pt,./preprocess/noise_profiles/nikon_profile.pt')
+                        default='./preprocess/noise_profiles/samsung_profile.pt,./preprocess/noise_profiles/iphone_profile.pt')
 
     # directory for testing
-    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/out_db_3/expr/results',
+    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/r2r-best-v1/expr/results',
                         help='Directory for saving generated images and videos')
 
     # step size

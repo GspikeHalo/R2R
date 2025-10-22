@@ -17,6 +17,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class RawPolyExpand(nn.Module):
+    """
+    4ch RAW -> 14ch：4 原始 + 4 平方 + 6 交叉。
+    约定：输入 x in [-1,1]；内部转到 [0,1] 做展开，再映回 [-1,1]。
+    """
+    def __init__(self, re_normalize_back=True):
+        super().__init__()
+        self.re_normalize_back = re_normalize_back
+
+    def forward(self, x):  # x: [B,4,H,W] in [-1,1]
+        x01 = x.mul(0.5).add(0.5).clamp_(0, 1)           # [-1,1] -> [0,1]
+        r, gr, gb, b = x01[:,0], x01[:,1], x01[:,2], x01[:,3]
+
+        feats   = [r, gr, gb, b]                         # 4
+        squares = [r*r, gr*gr, gb*gb, b*b]               # +4
+        crosses = [r*gr, r*gb, r*b, gr*gb, gr*b, gb*b]   # +6 = 14
+        y = torch.stack(feats + squares + crosses, dim=1)  # [B,14,H,W]
+
+        if self.re_normalize_back:
+            y = y.mul(2.0).add_(-1.0)                    # 回到 [-1,1]
+        return y
+
 class ChannelGainPerDomain(nn.Module):
     def __init__(self, num_domains: int, init_gain=1.0, eps=1e-6):
         super().__init__()
@@ -190,15 +212,19 @@ class AdainResBlk(nn.Module):
         return (res + skip) / math.sqrt(2)
 
 class Generator(nn.Module):
-    def __init__(self, img_size=256, style_dim=64, max_conv_dim=512, num_domains=2, use_chan_gain=True, init_gain=1.0, eps=1e-6):
+    def __init__(self, img_size=256, style_dim=64, max_conv_dim=512, num_domains=2, use_chan_gain=True, init_gain=1.0, eps=1e-6, use_poly14_in=True):
         super().__init__()
         dim_in = 2**14 // img_size
         self.img_size = img_size
         self.use_chan_gain = use_chan_gain
+        self.use_poly14_in = use_poly14_in
         if use_chan_gain:
             self.chan_gain = ChannelGainPerDomain(num_domains=num_domains, init_gain=init_gain, eps=eps)
 
-        self.from_raw = nn.Conv2d(4, dim_in, 3, 1, 1)
+        # self.from_raw = nn.Conv2d(4, dim_in, 3, 1, 1)
+        self.poly_expand = RawPolyExpand() if self.use_poly14_in else nn.Identity()
+        in_ch = 14 if self.use_poly14_in else 4
+        self.from_raw = nn.Conv2d(in_ch, dim_in, 3, 1, 1)
         self.encode = nn.ModuleList()
         self.decode = nn.ModuleList()
         self.to_raw = nn.Sequential(
@@ -226,7 +252,7 @@ class Generator(nn.Module):
     def forward(self, x, s, y_org=None, c_t=None):
         if self.use_chan_gain and (y_org is not None):
             x = self.chan_gain.inverse(x, y_org)
-
+        x = self.poly_expand(x)
         x = self.from_raw(x)
         skips = []
         for block in self.encode:
@@ -247,15 +273,17 @@ class Generator(nn.Module):
         return x
 
 class StyleEncoder(nn.Module):
-    def __init__(self, img_size=256, style_dim=64, num_domains=2, max_conv_dim=512):
+    def __init__(self, img_size=256, style_dim=64, num_domains=2, max_conv_dim=512, use_poly14_in=True):
         super().__init__()
         dim_in = 2**14 // img_size
-        blocks = []
-        blocks += [nn.Conv2d(4, dim_in, 3, 1, 1)]
-
+        # blocks = [nn.Conv2d(4, dim_in, 3, 1, 1)]
+        self.use_poly14_in = use_poly14_in
+        self.poly_expand = RawPolyExpand() if self.use_poly14_in else nn.Identity()
+        in_ch = 14 if self.use_poly14_in else 4
+        blocks = [nn.Conv2d(in_ch, dim_in, 3, 1, 1)]
         repeat_num = int(np.log2(img_size)) - 2
         for _ in range(repeat_num):
-            dim_out = min(dim_in*2, max_conv_dim)
+            dim_out = min(dim_in * 2, max_conv_dim)
             blocks += [ResBlk(dim_in, dim_out, downsample=True)]
             dim_in = dim_out
 
@@ -264,19 +292,13 @@ class StyleEncoder(nn.Module):
         blocks += [nn.LeakyReLU(0.2)]
         self.shared = nn.Sequential(*blocks)
 
-        self.unshared = nn.ModuleList()
-        for _ in range(num_domains):
-            self.unshared += [nn.Linear(dim_out, style_dim)]
+        self.proj = nn.Linear(dim_out, style_dim)
 
-    def forward(self, x, y):
-        h = self.shared(x)
-        h = h.view(h.size(0), -1)
-        out = []
-        for layer in self.unshared:
-            out += [layer(h)]
-        out = torch.stack(out, dim=1)  # (batch, num_domains, style_dim)
-        idx = torch.LongTensor(range(y.size(0))).to(y.device)
-        s = out[idx, y]  # (batch, style_dim)
+    def forward(self, x, y=None):
+        x = self.poly_expand(x)
+        h = self.shared(x)              # [B, C, 1, 1]
+        h = h.view(h.size(0), -1)       # [B, C]
+        s = self.proj(h)                # [B, style_dim]
         return s
 
 

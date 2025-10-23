@@ -266,7 +266,6 @@ class StyleEncoder(nn.Module):
         self.proj = nn.Linear(dim_out, style_dim)
 
     def forward(self, x, y=None):
-        x = self.poly_expand(x)
         h = self.shared(x)              # [B, C, 1, 1]
         h = h.view(h.size(0), -1)       # [B, C]
         s = self.proj(h)                # [B, style_dim]

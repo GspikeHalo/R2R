@@ -521,8 +521,6 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None,
     out = nets.discriminator(x_fake, y_trg)
     loss_adv = adv_loss(out, 1)
 
-    loss_edge = edge_aware_loss(x_fake, x_real)
-
     # style reconstruction loss
     s_pred = nets.style_encoder(x_fake, y_trg)
     loss_sty = torch.mean(torch.abs(s_pred - s_trg))
@@ -567,8 +565,7 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None,
             + getattr(args, 'lambda_noise', 0.0) * loss_noise
             + lambda_id * loss_id
             + getattr(args, 'lambda_cyc_ssim', 0.0) * loss_cyc_ssim
-            + getattr(args, 'lambda_id_ssim', 0.0) * loss_id_ssim
-            + args.lambda_edge * loss_edge )
+            + getattr(args, 'lambda_id_ssim', 0.0) * loss_id_ssim )
 
     return loss, Munch(
         adv=loss_adv.item(),
@@ -579,7 +576,6 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None,
         id=loss_id.item(),
         cyc_ssim=(loss_cyc_ssim.item() if torch.is_tensor(loss_cyc_ssim) else 0.0),
         id_ssim=(loss_id_ssim.item() if torch.is_tensor(loss_id_ssim) else 0.0),
-        edge_loss=loss_edge
     )
 
 def moving_average(model, model_test, beta=0.999):
@@ -604,22 +600,6 @@ def r1_reg(d_out, x_in):
     grad_dout2 = grad_dout.pow(2)
     reg = 0.5 * grad_dout2.view(batch_size, -1).sum(1).mean(0)
     return reg
-
-def edge_aware_loss(pred, target):
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-                           dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-                           dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
-
-    pred_edges_x = F.conv2d(pred, sobel_x.repeat(4, 1, 1, 1), padding=1, groups=4)
-    pred_edges_y = F.conv2d(pred, sobel_y.repeat(4, 1, 1, 1), padding=1, groups=4)
-    pred_edges = torch.sqrt(pred_edges_x ** 2 + pred_edges_y ** 2)
-
-    target_edges_x = F.conv2d(target, sobel_x.repeat(4, 1, 1, 1), padding=1, groups=4)
-    target_edges_y = F.conv2d(target, sobel_y.repeat(4, 1, 1, 1), padding=1, groups=4)
-    target_edges = torch.sqrt(target_edges_x ** 2 + target_edges_y ** 2)
-
-    return F.l1_loss(pred_edges, target_edges)
 
 class NoiseHistogramLoss(nn.Module):
     def __init__(self, profile_path, patch_size=16, stride=None, keep_ratio=None, use_mad=True, device='cuda', eps=1e-8):

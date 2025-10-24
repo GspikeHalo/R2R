@@ -161,8 +161,6 @@ def get_train_loader(root, which='source', img_size=256,
     if (which == 'source') and (fixed_filenames is not None):
         transform = transforms.Compose([
             transforms.Resize([img_size, img_size]),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
-                                 std =[0.5, 0.5, 0.5, 0.5]),
         ])
     else:
         crop = transforms.RandomResizedCrop(
@@ -174,8 +172,6 @@ def get_train_loader(root, which='source', img_size=256,
             rand_crop,
             transforms.Resize([img_size, img_size]),
             transforms.RandomHorizontalFlip(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
-                                 std=[0.5, 0.5, 0.5, 0.5]),
         ])
 
     if which == 'source':
@@ -206,8 +202,6 @@ def get_test_loader(root, domains, img_size=256, batch_size=32,
     print('Preparing DataLoader for the generation phase (4-ch npy)...')
     transform = transforms.Compose([
         transforms.Resize([img_size, img_size]),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
-                             std =[0.5, 0.5, 0.5, 0.5]),
     ])
 
     paired_ds = PairedNpyDataset(

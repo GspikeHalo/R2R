@@ -98,8 +98,6 @@ class Solver(nn.Module):
 
         self.ref_transform = transforms.Compose([
             transforms.Resize([self.args.img_size, self.args.img_size]),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
-                                 std=[0.5, 0.5, 0.5, 0.5]),
         ])
 
     def _save_checkpoint(self, step):
@@ -114,11 +112,6 @@ class Solver(nn.Module):
         for optim in self.optims.values():
             optim.zero_grad()
 
-    def denorm(self, x):
-        """Convert the range from [-1, 1] to [0, 1]."""
-        out = (x + 1) / 2
-        return out.clamp_(0, 1)
-
     def rggb2rgb(self, img):
         r, gr, gb, b = img[0], img[1], img[2], img[3]
         return torch.stack([r, 0.5 * (gr + gb), b], 0)
@@ -126,7 +119,7 @@ class Solver(nn.Module):
     def _noise_loss_batch(self, x_fake, y_trg):
         if (self.noise_losses is None) or (self.args.lambda_noise <= 0):
             return x_fake.new_zeros([])
-        x_lin = x_fake.mul(0.5).add(0.5).clamp(0, 1)
+        x_lin = x_fake.clamp(0, 1)
         if len(self.noise_losses) == 1:
             return self.noise_losses[0](x_lin)
         tot = x_fake.new_zeros([])
@@ -255,7 +248,7 @@ class Solver(nn.Module):
                             c_t = torch.full((B,), domain, dtype=torch.long, device=x_fixed.device)
                             s_t = nets_ema.style_encoder(x_ref_d, c_t)
                             x_fake = nets_ema.generator(x_fixed, s_t)
-                            x_fake_den = self.denorm(x_fake)
+                            x_fake_den = x_fake.clamp(0, 1)
 
                             if args.use_wandb:
                                 for b in range(B):
@@ -311,7 +304,7 @@ class Solver(nn.Module):
 
         pairs = list(combinations(domains, 2))  # [('iphone-x','samsung-s9'), ...]
 
-        K = int(getattr(self.args, "test_kshot", 4))
+        K = int(getattr(self.args, "test_kshot", 1))
         K = max(1, K)
 
         def _psnr(x, y, max_val=1.0, eps=1e-10):
@@ -392,8 +385,8 @@ class Solver(nn.Module):
 
                 x_fake = self.generator_ema(x_src, s_t, y_org=y_src, c_t=y_tgt)
 
-                x_fake_den = self.denorm(x_fake)
-                x_tgt_den  = self.denorm(x_tgt)
+                x_fake_den = x_fake.clamp(0, 1)
+                x_tgt_den  = x_tgt.clamp(0, 1)
 
                 mae_f  = torch.abs(x_fake_den - x_tgt_den).view(B, -1).mean(dim=1).sum().item()
                 psnr_f = _psnr(x_fake_den, x_tgt_den).sum().item()
@@ -408,12 +401,24 @@ class Solver(nn.Module):
                 tot[key_fwd]["count"] += B
 
                 if not self.args.use_wandb:
-                    src_rgb  = self.rggb2rgb(self.denorm(x_src)[0])
-                    fake_rgb = self.rggb2rgb(x_fake_den[0])
-                    tgt_rgb  = self.rggb2rgb(x_tgt_den[0])
-                    save_image(torch.stack([src_rgb, fake_rgb, tgt_rgb], 0),
-                            os.path.join(trip_dir, f"{src}2{tgt}_batch{batch_i}.png"),
-                            nrow=3)
+                    b0 = 0
+                    src_rgb = self.rggb2rgb(x_src.clamp(0, 1)[b0])
+                    fake_rgb = self.rggb2rgb(x_fake_den.clamp(0, 1)[b0])
+                    tgt_rgb = self.rggb2rgb(x_tgt_den[b0])
+
+                    if K == 1:
+                        ref_idx0 = idx_matrix[b0, 0].item()
+                        ref_rgb = self.rggb2rgb(x_tgt.clamp(0, 1)[ref_idx0])
+                        panel = torch.stack([src_rgb, ref_rgb, fake_rgb, tgt_rgb], 0)  # [src, ref, fake, tgt]
+                        nrow = 4
+                    else:
+                        panel = torch.stack([src_rgb, fake_rgb, tgt_rgb], 0)
+                        nrow = 3
+
+                    save_image(panel,
+                               os.path.join(trip_dir, f"{src}2{tgt}_batch{batch_i}.png"),
+                               nrow=nrow)
+
                     os.makedirs(os.path.join(fake_root, tgt), exist_ok=True)
                     save_image(fake_rgb,
                             os.path.join(fake_root, tgt, f"{src}2{tgt}_batch{batch_i}_fake.png"))
@@ -440,8 +445,8 @@ class Solver(nn.Module):
 
                 x_fake_rev = self.generator_ema(x_tgt, s_s, y_org=y_tgt, c_t=y_src)
 
-                x_fake_rev_den = self.denorm(x_fake_rev)
-                x_src_den = self.denorm(x_src)
+                x_fake_rev_den = x_fake_rev.clamp(0, 1)
+                x_src_den = x_src.clamp(0, 1)
 
                 mae_r  = torch.abs(x_fake_rev_den - x_src_den).view(B, -1).mean(dim=1).sum().item()
                 psnr_r = _psnr(x_fake_rev_den, x_src_den).sum().item()
@@ -454,6 +459,29 @@ class Solver(nn.Module):
                 tot[key_rev]["ssim"]  += ssim_r
                 tot[key_rev]["kl"]    += kl_r
                 tot[key_rev]["count"] += B
+
+                if not self.args.use_wandb:
+                    b0 = 0
+                    tgt_rgb = self.rggb2rgb(x_tgt.clamp(0, 1)[b0])
+                    fake_rev_rgb = self.rggb2rgb(x_fake_rev_den.clamp(0, 1)[b0])
+                    src_rgb = self.rggb2rgb(x_src_den[b0])
+
+                    if K == 1:
+                        ref_idx0 = idx_matrix[b0, 0].item()
+                        ref_rgb = self.rggb2rgb(x_src.clamp(0, 1)[ref_idx0])
+                        panel = torch.stack([tgt_rgb, ref_rgb, fake_rev_rgb, src_rgb], 0)  # [tgt, ref, fake_rev, src]
+                        nrow = 4
+                    else:
+                        panel = torch.stack([tgt_rgb, fake_rev_rgb, src_rgb], 0)
+                        nrow = 3
+
+                    save_image(panel,
+                               os.path.join(trip_dir, f"{tgt}2{src}_batch{batch_i}.png"),
+                               nrow=nrow)
+
+                    os.makedirs(os.path.join(fake_root, src), exist_ok=True)
+                    save_image(fake_rev_rgb,
+                               os.path.join(fake_root, src, f"{tgt}2{src}_batch{batch_i}_fake.png"))
 
         for key, v in tot.items():
             cnt = max(1, v["count"])

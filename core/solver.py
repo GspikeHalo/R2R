@@ -78,7 +78,7 @@ class Solver(nn.Module):
             ]
 
             self.best_mae = float('inf')
-            self.ssim_train = SSIM(data_range=1.0, channel=4, size_average=True).to(self.device)
+            self.ssim_train = SSIM(data_range=2.0, channel=4, size_average=True).to(self.device)
         else:
             if self.args.best_model:
                 ema_template = os.path.join(self.args.checkpoint_dir, 'best_nets_ema.ckpt')

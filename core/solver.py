@@ -13,6 +13,7 @@ from os.path import join as ospj
 import time
 import datetime
 from munch import Munch
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -25,6 +26,7 @@ from core.data_loader import InputFetcher
 import core.utils as utils
 from tqdm import tqdm
 from torchvision.utils import save_image
+from torchvision import transforms
 
 import wandb
 
@@ -93,6 +95,14 @@ class Solver(nn.Module):
                 print('Initializing %s...' % name)
                 network.apply(utils.he_init)
 
+        self.ref_transform = transforms.Compose([
+            transforms.Resize([self.args.img_size, self.args.img_size]),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
+                                 std =[0.5, 0.5, 0.5, 0.5]),
+        ])
+
+        self.val_ref_pool_cmeans = None  # {domain: [(abs_path, mean_vec[4]), ...]}
+
     def _save_checkpoint(self, step):
         for ckptio in self.ckptios:
             ckptio.save(step)
@@ -113,6 +123,60 @@ class Solver(nn.Module):
     def rggb2rgb(self, img):
         r, gr, gb, b = img[0], img[1], img[2], img[3]
         return torch.stack([r, 0.5 * (gr + gb), b], 0)
+
+    def _to01(self, x_m11: torch.Tensor) -> torch.Tensor:
+        return x_m11.mul(0.5).add(0.5).clamp(0, 1)
+
+    def _channel_means(self, x_m11: torch.Tensor) -> torch.Tensor:
+        """
+        输入：[-1,1]，形状 [4,H,W] 或 [1,4,H,W]
+        输出：通道均值向量 [4] in [0,1]（R, GR, GB, B）
+        """
+        if x_m11.dim() == 4 and x_m11.size(0) == 1:
+            x_m11 = x_m11[0]
+        x01 = self._to01(x_m11)
+        return x01.view(4, -1).mean(dim=1).cpu()
+
+    def _build_val_ref_pool_by_cmeans(self, root_dir: str):
+        """
+        为每个 domain 建立 [(abs_path, mean_vec[4]), ...]（使用 ref_transform 后计算）
+        """
+        root_p = self.args.val_img_dir if root_dir is None else root_dir
+        root_p = os.path.abspath(root_p)
+        pool = {}
+        for d in sorted(os.listdir(root_p)):
+            ddir = os.path.join(root_p, d)
+            if not os.path.isdir(ddir):
+                continue
+            items = []
+            for fn in sorted(os.listdir(ddir)):
+                if not fn.endswith('.npy'):
+                    continue
+                pth = os.path.join(ddir, fn)
+                arr = np.load(pth)                     # (4,H,W)
+                ten = torch.from_numpy(arr).float()
+                ten = self.ref_transform(ten)          # [-1,1]
+                mv = self._channel_means(ten)          # [4] cpu
+                items.append((os.path.abspath(pth), mv))
+            pool[d] = items
+        self.val_ref_pool_cmeans = pool
+
+    def _select_ref_by_cmeans(self, domain: str, target_vec: torch.Tensor,
+                              exclude_path: str) -> torch.Tensor:
+        """
+        在指定 domain 内按 ||mean_vec - target_vec||2 选取**单张**参考，排除 exclude_path。
+        返回形状 [4,H,W]，已做 ref_transform，范围 [-1,1]。
+        """
+        assert self.val_ref_pool_cmeans is not None, "call _build_val_ref_pool_by_cmeans first."
+        cands = [(p, m) for (p, m) in self.val_ref_pool_cmeans.get(domain, []) if p != exclude_path]
+        if not cands:
+            raise RuntimeError(f"No candidates in pool for domain={domain}")
+        tv = target_vec.cpu()
+        p_sel, _ = min(cands, key=lambda t: torch.linalg.norm(t[1] - tv).item())
+        arr = np.load(p_sel)
+        ten = torch.from_numpy(arr).float()
+        ten = self.ref_transform(ten)
+        return ten
 
     def _noise_loss_batch(self, x_fake, y_trg):
         if (self.noise_losses is None) or (self.args.lambda_noise <= 0):
@@ -138,7 +202,7 @@ class Solver(nn.Module):
         # fetch random validation images for debugging
         fetcher = InputFetcher(loaders.src, loaders.ref, 'train')
         fetcher_val = InputFetcher(loaders.val, None, 'val')
-        inputs_val = next(fetcher_val)
+        _ = next(fetcher_val)
 
         # resume training if necessary
         if args.resume_iter > 0:
@@ -222,17 +286,14 @@ class Solver(nn.Module):
                             if mask.sum() == 0:
                                 continue
                             x_ref_pool = x_ref_all[mask]
-                            K = x_ref_pool.size(0)
-
-                            if K < B:
-                                idx = torch.randint(low=0, high=K, size=(B,), device=x_ref_pool.device)
-                                x_ref_d = x_ref_pool[idx]
-                            elif K > B:
-                                idx = torch.randperm(K, device=x_ref_pool.device)[:B]
-                                x_ref_d = x_ref_pool[idx]
+                            Kp = x_ref_pool.size(0)
+                            if Kp < B:
+                                idx = torch.randint(low=0, high=Kp, size=(B,), device=x_ref_pool.device)
+                            elif Kp > B:
+                                idx = torch.randperm(Kp, device=x_ref_pool.device)[:B]
                             else:
-                                x_ref_d = x_ref_pool
-
+                                idx = torch.arange(B, device=x_ref_pool.device)
+                            x_ref_d = x_ref_pool[idx]
                             c_t = torch.full((B,), domain, dtype=torch.long, device=x_fixed.device)
                             s_t = nets_ema.style_encoder(x_ref_d, c_t)
                             x_fake = nets_ema.generator(x_fixed, s_t)
@@ -269,6 +330,7 @@ class Solver(nn.Module):
 
     @torch.no_grad()
     def test(self, step=None):
+        from itertools import combinations
         if step is None:
             step = self.args.resume_iter
 
@@ -276,23 +338,20 @@ class Solver(nn.Module):
         self.generator_ema.eval()
         self.style_encoder_ema.eval()
 
+        self._build_val_ref_pool_by_cmeans(self.args.val_img_dir)
+
         os.makedirs(self.args.result_dir, exist_ok=True)
-
-        domains = sorted(os.listdir(self.args.val_img_dir))
-        domain2idx = {d: i for i, d in enumerate(domains)}  # {iphone:0}
-        pairs = [(s, t) for s in domains for t in domains if s != t]
-
         trip_dir = os.path.join(self.args.result_dir, "triptychs")
         fake_root = os.path.join(self.args.result_dir, "fakes_by_target")
         os.makedirs(trip_dir, exist_ok=True)
-        for d in domains:
-            os.makedirs(os.path.join(fake_root, d), exist_ok=True)
+        os.makedirs(fake_root, exist_ok=True)
 
-        tot = {
-            f"{s}->{t}": {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
-            for s, t in pairs
-        }
-        tot_imgs = 0
+        domains = sorted(
+            d for d in os.listdir(self.args.val_img_dir)
+            if os.path.isdir(os.path.join(self.args.val_img_dir, d))
+        )
+        domain2idx = {d: i for i, d in enumerate(domains)}
+        pairs = list(combinations(domains, 2))
 
         def _psnr(x, y, max_val=1.0, eps=1e-10):
             mse = ((x - y) ** 2).mean(dim=[1, 2, 3])
@@ -329,75 +388,116 @@ class Solver(nn.Module):
         ssim_fn = SSIM(data_range=1.0, channel=4, size_average=False).to(self.device)
         kl_bins = int(getattr(self.args, 'kl_bins', 256))
 
-        for batch_i, (imgs_dict, filenames) in enumerate(
-                tqdm(self.test_loader, desc="Testing")):
-            B = next(iter(imgs_dict.values())).size(0)
-            tot_imgs += B
+        tot = {}
+        for a, b in pairs:
+            tot[f"{a}->{b}"] = {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
+            tot[f"{b}->{a}"] = {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
 
+        for batch_i, (imgs_dict, filenames) in enumerate(tqdm(self.test_loader, desc="Testing")):
             for d in domains:
                 imgs_dict[d] = imgs_dict[d].to(self.device)
+
+            B = next(iter(imgs_dict.values())).size(0)
+            if B <= 1:
+                continue
+
+            fnames = list(filenames) if isinstance(filenames, (list, tuple)) else [filenames] * B
 
             for src, tgt in pairs:
                 x_src = imgs_dict[src]
                 x_tgt = imgs_dict[tgt]
-
-                y_tgt = torch.full((B,), domain2idx[tgt], device=self.device, dtype=torch.long)
                 y_src = torch.full((B,), domain2idx[src], device=self.device, dtype=torch.long)
+                y_tgt = torch.full((B,), domain2idx[tgt], device=self.device, dtype=torch.long)
 
-                s_t = self.style_encoder_ema(x_tgt, y_tgt)
+                # ---- forward: src -> tgt，仅单参考（通道均值最近邻）
+                refs = []
+                for b in range(B):
+                    tvec = self._channel_means(x_tgt[b])
+                    exclude = os.path.abspath(os.path.join(self.args.val_img_dir, tgt, fnames[b]))
+                    ref = self._select_ref_by_cmeans(tgt, tvec, exclude)   # [4,H,W]
+                    refs.append(ref)
+                x_ref = torch.stack(refs, dim=0).to(self.device)            # [B,4,H,W]
+                s_t = self.style_encoder_ema(x_ref, y_tgt)                  # [B,S]
                 x_fake = self.generator_ema(x_src, s_t, y_org=y_src, c_t=y_tgt)
-                x_fake_den = self.denorm(x_fake)  # [0,1]
-                x_tgt_den = self.denorm(x_tgt)  # [0,1]
 
-                mae = torch.abs(x_fake_den - x_tgt_den).view(B, -1).mean(dim=1).sum().item()
-                psnr = _psnr(x_fake_den, x_tgt_den).sum().item()
-                ssim = ssim_fn(x_fake_den, x_tgt_den).sum().item()
-                kl_vals = _sym_kl_hist(x_fake_den, x_tgt_den, bins=kl_bins)
-                kl_sum = kl_vals.sum().item()
+                x_fake_den = self.denorm(x_fake)
+                x_tgt_den  = self.denorm(x_tgt)
 
-                key = f"{src}->{tgt}"
-                tot[key]["mae"] += mae
-                tot[key]["psnr"] += psnr
-                tot[key]["ssim"] += ssim
-                tot[key]["kl"] += kl_sum
-                tot[key]["count"] += B
+                mae_f  = torch.abs(x_fake_den - x_tgt_den).view(B, -1).mean(dim=1).sum().item()
+                psnr_f = _psnr(x_fake_den, x_tgt_den).sum().item()
+                ssim_f = ssim_fn(x_fake_den, x_tgt_den).sum().item()
+                kl_f   = _sym_kl_hist(x_fake_den, x_tgt_den, bins=kl_bins).sum().item()
+
+                key_fwd = f"{src}->{tgt}"
+                tot[key_fwd]["mae"]   += mae_f
+                tot[key_fwd]["psnr"]  += psnr_f
+                tot[key_fwd]["ssim"]  += ssim_f
+                tot[key_fwd]["kl"]    += kl_f
+                tot[key_fwd]["count"] += B
 
                 if not self.args.use_wandb:
-                    src_rgb = self.rggb2rgb(self.denorm(x_src)[0])
-                    fake_rgb = self.rggb2rgb(x_fake_den[0])
-                    tgt_rgb = self.rggb2rgb(x_tgt_den[0])
+                    b0 = 0
+                    src_rgb  = self.rggb2rgb(self.denorm(x_src)[b0])
+                    fake_rgb = self.rggb2rgb(x_fake_den[b0])
+                    tgt_rgb  = self.rggb2rgb(x_tgt_den[b0])
+                    ref_rgb  = self.rggb2rgb(self.denorm(x_ref)[b0])
+                    panel = torch.stack([src_rgb, ref_rgb, fake_rgb, tgt_rgb], 0)
+                    save_image(panel, os.path.join(trip_dir, f"{src}2{tgt}_batch{batch_i}.png"), nrow=4)
+                    os.makedirs(os.path.join(fake_root, tgt), exist_ok=True)
+                    save_image(fake_rgb, os.path.join(fake_root, tgt, f"{src}2{tgt}_batch{batch_i}_fake.png"))
 
-                    trip = torch.stack([src_rgb, fake_rgb, tgt_rgb], dim=0)
-                    save_image(
-                        trip,
-                        os.path.join(trip_dir, f"{src}2{tgt}_batch{batch_i}.png"),
-                        nrow=3
-                    )
+                # ---- reverse: tgt -> src，仅单参考
+                refs = []
+                for b in range(B):
+                    tvec = self._channel_means(x_src[b])
+                    exclude = os.path.abspath(os.path.join(self.args.val_img_dir, src, fnames[b]))
+                    ref = self._select_ref_by_cmeans(src, tvec, exclude)
+                    refs.append(ref)
+                x_ref_r = torch.stack(refs, dim=0).to(self.device)
+                s_s = self.style_encoder_ema(x_ref_r, y_src)
+                x_fake_rev = self.generator_ema(x_tgt, s_s, y_org=y_tgt, c_t=y_src)
 
-                    save_image(
-                        fake_rgb,
-                        os.path.join(fake_root, tgt, f"{src}2{tgt}_batch{batch_i}_fake.png")
-                    )
+                x_fake_rev_den = self.denorm(x_fake_rev)
+                x_src_den = self.denorm(x_src)
 
-        # print per–pair metrics
+                mae_r  = torch.abs(x_fake_rev_den - x_src_den).view(B, -1).mean(dim=1).sum().item()
+                psnr_r = _psnr(x_fake_rev_den, x_src_den).sum().item()
+                ssim_r = ssim_fn(x_fake_rev_den, x_src_den).sum().item()
+                kl_r   = _sym_kl_hist(x_fake_rev_den, x_src_den, bins=kl_bins).sum().item()
+
+                key_rev = f"{tgt}->{src}"
+                tot[key_rev]["mae"]   += mae_r
+                tot[key_rev]["psnr"]  += psnr_r
+                tot[key_rev]["ssim"]  += ssim_r
+                tot[key_rev]["kl"]    += kl_r
+                tot[key_rev]["count"] += B
+
+                if not self.args.use_wandb:
+                    b0 = 0
+                    tgt_rgb      = self.rggb2rgb(x_tgt_den[b0])
+                    fake_rev_rgb = self.rggb2rgb(x_fake_rev_den[b0])
+                    src_rgb      = self.rggb2rgb(x_src_den[b0])
+                    ref_rev_rgb  = self.rggb2rgb(self.denorm(x_ref_r)[b0])
+                    panel = torch.stack([tgt_rgb, ref_rev_rgb, fake_rev_rgb, src_rgb], 0)
+                    save_image(panel, os.path.join(trip_dir, f"{tgt}2{src}_batch{batch_i}.png"), nrow=4)
+                    os.makedirs(os.path.join(fake_root, src), exist_ok=True)
+                    save_image(fake_rev_rgb, os.path.join(fake_root, src, f"{tgt}2{src}_batch{batch_i}_fake.png"))
+
         for key, v in tot.items():
-            cnt = v["count"]
-            print(f"{key}  MAE:{v['mae'] / cnt:.4f} "
-                  f"PSNR:{v['psnr'] / cnt:.2f} "
-                  f"SSIM:{v['ssim'] / cnt:.4f} "
-                  f"KL:{v['kl'] / cnt:.6f}")
+            cnt = max(1, v["count"])
+            print(f"{key}  MAE:{v['mae']/cnt:.4f} PSNR:{v['psnr']/cnt:.2f} "
+                f"SSIM:{v['ssim']/cnt:.4f} KL:{v['kl']/cnt:.6f}")
 
-        # overall micro-average across all pairs
-        total_mae = sum(v["mae"] for v in tot.values())
+        total_mae  = sum(v["mae"]  for v in tot.values())
         total_psnr = sum(v["psnr"] for v in tot.values())
         total_ssim = sum(v["ssim"] for v in tot.values())
-        total_kl = sum(v["kl"] for v in tot.values())
-        total_count = sum(v["count"] for v in tot.values())
+        total_kl   = sum(v["kl"]   for v in tot.values())
+        total_cnt  = sum(v["count"] for v in tot.values())
 
-        avg_mae = total_mae / total_count
-        avg_psnr = total_psnr / total_count
-        avg_ssim = total_ssim / total_count
-        avg_kl = total_kl / total_count
+        avg_mae  = total_mae / total_cnt if total_cnt > 0 else float('nan')
+        avg_psnr = total_psnr / total_cnt if total_cnt > 0 else float('nan')
+        avg_ssim = total_ssim / total_cnt if total_cnt > 0 else float('nan')
+        avg_kl   = total_kl   / total_cnt if total_cnt > 0 else float('nan')
 
         print(f"Avg all  MAE:{avg_mae:.4f} "
               f"PSNR:{avg_psnr:.2f} "
@@ -409,11 +509,12 @@ class Solver(nn.Module):
             metrics = {}
             for key, v in tot.items():
                 cnt = v["count"]
+                if cnt == 0:
+                    continue
                 metrics[f"{key}/MAE"] = v["mae"] / cnt
                 metrics[f"{key}/PSNR"] = v["psnr"] / cnt
                 metrics[f"{key}/SSIM"] = v["ssim"] / cnt
                 metrics[f"{key}/KL"] = v["kl"] / cnt
-            # also log the micro-averages
             metrics["Avg/MAE"] = avg_mae
             metrics["Avg/PSNR"] = avg_psnr
             metrics["Avg/SSIM"] = avg_ssim
@@ -494,7 +595,7 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None,
             + getattr(args, 'lambda_noise', 0.0) * loss_noise
             + lambda_id * loss_id
             + getattr(args, 'lambda_cyc_ssim', 0.0) * loss_cyc_ssim
-            + getattr(args, 'lambda_id_ssim', 0.0) * loss_id_ssim)
+            + getattr(args, 'lambda_id_ssim', 0.0) * loss_id_ssim )
 
     return loss, Munch(
         adv=loss_adv.item(),
@@ -504,7 +605,7 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None,
         noise=loss_noise.item(),
         id=loss_id.item(),
         cyc_ssim=(loss_cyc_ssim.item() if torch.is_tensor(loss_cyc_ssim) else 0.0),
-        id_ssim=(loss_id_ssim.item() if torch.is_tensor(loss_id_ssim) else 0.0)
+        id_ssim=(loss_id_ssim.item() if torch.is_tensor(loss_id_ssim) else 0.0),
     )
 
 def moving_average(model, model_test, beta=0.999):
@@ -529,7 +630,6 @@ def r1_reg(d_out, x_in):
     grad_dout2 = grad_dout.pow(2)
     reg = 0.5 * grad_dout2.view(batch_size, -1).sum(1).mean(0)
     return reg
-
 
 class NoiseHistogramLoss(nn.Module):
     def __init__(self, profile_path, patch_size=16, stride=None, keep_ratio=None, use_mad=True, device='cuda', eps=1e-8):

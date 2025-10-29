@@ -5,17 +5,22 @@ from munch import Munch
 from torch.backends import cudnn
 import torch
 
-from core.data_loader import get_train_loader, get_test_loader
+from core.data_loader import get_train_loader, get_test_loader_pairdirs
 from core.solver import Solver
 from pathlib import Path
 
 import wandb
 
-
+# FIXINPUT={
+#     'huawei': ['139.npy', '661.npy', '2091.npy','1920.npy','3209.npy','3513.npy','3797.npy','3609.npy'],
+#     'nikon': ['139.npy', '661.npy', '2091.npy','1920.npy','3209.npy','3513.npy','3797.npy','3609.npy'],
+# }
 FIXINPUT={
-    'samsung': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',],
-    'huawei': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',],
-    'nikon': ['1.npy', '2.npy', '3.npy','4.npy','5.npy','6.npy','7.npy','8.npy',]
+    'iphone': ['74.npy', '151.npy', '268.npy','389.npy','541.npy','2565.npy','3634.npy',],
+    'samsung': ['66.npy', '124.npy', '205.npy','408.npy','857.npy','1024.npy','2058.npy',],
+    'huawei': ['139.npy', '661.npy', '2091.npy','1920.npy','3209.npy','3513.npy','3797.npy'],
+    'nikon': ['139.npy', '661.npy', '2091.npy','1920.npy','3209.npy','3513.npy','3797.npy'],
+    'canon': ['51.npy', '79.npy', '329.npy','757.npy','1205.npy','1455.npy','1541.npy',]
 }
 
 # FIXINPUT={
@@ -54,7 +59,7 @@ def main(args):
             project='StarGAN-R2R',
             entity='bias-lab',
             config=vars(args),
-            name="our_db"
+            name="odb_final"
         )
 
     solver = Solver(args)
@@ -81,15 +86,30 @@ def main(args):
                                              prob=args.randcrop_prob,
                                              fixed_filenames=FIXINPUT))
 
-        domains=getDomains(args.val_img_dir)
-        solver.test_loader = get_test_loader(args.val_img_dir, domains, args.img_size, args.val_batch_size,
-                                               False, args.num_workers)
+        solver.test_loader = get_test_loader_pairdirs(
+            root=args.val_img_dir,
+            img_size=args.img_size,
+            batch_size=args.val_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers
+        )
+
         solver.train(loaders)
     elif args.mode == 'eval':
-        domains = getDomains(args.val_img_dir)
-        solver.test_loader = get_test_loader(args.val_img_dir, domains, args.img_size, args.val_batch_size,
-                                               False, args.num_workers)
+        solver.test_loader = get_test_loader_pairdirs(
+            root=args.val_img_dir,
+            img_size=args.img_size,
+            batch_size=args.val_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers
+        )
         solver.test()
+    else:
+        raise NotImplementedError
+
+    if args.use_wandb:
+        wandb.finish()
+
     else:
         raise NotImplementedError
 
@@ -103,7 +123,7 @@ if __name__ == '__main__':
     # model arguments
     parser.add_argument('--img_size', type=int, default=256,
                         help='Image resolution')
-    parser.add_argument('--num_domains', type=int, default=3,
+    parser.add_argument('--num_domains', type=int, default=5,
                         help='Number of domains')
     parser.add_argument('--style_dim', type=int, default=64,
                         help='Style code dimension')
@@ -135,7 +155,7 @@ if __name__ == '__main__':
                         help='Iterations to resume training/testing')
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for training')
-    parser.add_argument('--val_batch_size', type=int, default=32,
+    parser.add_argument('--val_batch_size', type=int, default=16,
                         help='Batch size for validation')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate for D, E and G')
@@ -158,19 +178,19 @@ if __name__ == '__main__':
                         help='Seed for random number generator')
 
     # directory for training
-    parser.add_argument('--train_img_dir', type=str, default='/media/Data_2/R2RResult/r2r-odb/processed/unpaired',
+    parser.add_argument('--train_img_dir', type=str, default='/media/Data_2/R2RResult/odb-full-v1/processed/unpaired',
                         help='Directory containing training images')
-    parser.add_argument('--val_img_dir', type=str, default='/media/Data_2/R2RResult/r2r-odb/processed/test',
+    parser.add_argument('--val_img_dir', type=str, default='/media/Data_2/R2RResult/odb-full-v1/processed/test',
                         help='Directory containing validation images')
-    parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/r2r-odb/processed/unpaired',
+    parser.add_argument('--sample_dir', type=str, default='/media/Data_2/R2RResult/odb-full-v1/processed/unpaired',
                         help='Directory for saving generated images')
-    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/out_db_3/expr/checkpoints',
+    parser.add_argument('--checkpoint_dir', type=str, default='/media/Data_2/R2RResult/Results/our_db_v2_4/expr/checkpoints',
                         help='Directory for saving network checkpoints')
     parser.add_argument('--noise_profile_paths', type=str,
-                        default='./preprocess/noise_profiles/samsung_profile.pt,./preprocess/noise_profiles/huawei_profile.pt,./preprocess/noise_profiles/nikon_profile.pt')
+                            default='./preprocess/noise_profiles/iphone_profile.pt,./preprocess/noise_profiles/samsung_profile.pt,./preprocess/noise_profiles/huawei_profile.pt,./preprocess/noise_profiles/nikon_profile.pt,./preprocess/noise_profiles/canon_profile.pt')
 
     # directory for testing
-    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/out_db_3/expr/results',
+    parser.add_argument('--result_dir', type=str, default='/media/Data_2/R2RResult/Results/our_db_v2_4/expr/results',
                         help='Directory for saving generated images and videos')
 
     # step size

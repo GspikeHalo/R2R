@@ -26,8 +26,7 @@ POSTFIX_TO_CAM = {
     'D': 'samsung',
     'E': 'canon'
 }
-# CAMERAS = ['iphone', 'huawei', 'nikon', 'samsung', 'canon']
-CAMERAS = ['huawei', 'nikon']
+CAMERAS = ['iphone', 'huawei', 'nikon', 'samsung', 'canon']
 
 
 RAW_VAR_CANDIDATES = ['raw_rggb']
@@ -84,8 +83,8 @@ if __name__ == '__main__':
     parser.add_argument('--type', choices=['zoom', 'split'], default='split')  # 切块策略 patching strategy
     parser.add_argument('--processed_image_size', type=list, default=[512, 384])  # 仅在 type=zoom 时使用
     parser.add_argument('--patch_size', default=256, type=int)  # 四通道 RGGB 的 patch 尺寸
-    parser.add_argument('--parent_path', default='/media/Data_2/R2RResult/r2r-odb-v2/')
-    parser.add_argument('--paired_data_path', default='paired')
+    parser.add_argument('--parent_path', default='/media/Data_2/R2RResult/odb-full-v1/')
+    parser.add_argument('--paired_data_path', default='')
     parser.add_argument('--unpaired_data_path', default='unpaired')
     parser.add_argument('--processed_data_path', default='processed')
     parser.add_argument('--raw_path', default='raw-rggb')  # 仅 unpaired 用；paired 固定为 'raw'
@@ -172,10 +171,10 @@ if __name__ == '__main__':
 
     # -----------------------------
     # Part 2: Unpaired
-    # 读取 {parent}/unpaired/{camera}/raw-rggb/*.mat 结构（与预处理输出一致）
+    # 读取 {parent}/unpaired/{camera}/raw/*.mat 结构（与预处理输出一致）
     # -----------------------------
     for cam in CAMERAS:
-        in_dir = os.path.join(args.unpaired_data_path, cam, args.raw_path)  # 默认 raw-rggb
+        in_dir = os.path.join(args.unpaired_data_path, cam, args.raw_path)  # 默认 raw
         if not os.path.isdir(in_dir):
             print(f'[WARN] unpaired input dir not found: {in_dir}')
             continue

@@ -112,39 +112,72 @@ class ReferenceDataset(data.Dataset):
     def __len__(self):
         return len(self.targets)
 
-class PairedNpyDataset(data.Dataset):
-    def __init__(self, root: str, domains: list[str], transform=None):
+def _parse_pair_dir_name(dirname: str):
+    parts = dirname.split('_')
+    if len(parts) != 2:
+        raise ValueError(f"Invalid pair folder name: {dirname}. Expected 'src_tgt'.")
+    return parts[0], parts[1]
+
+class PairDirsPairedNpyDataset(data.Dataset):
+    """
+    目录结构（layout）:
+      val_img_dir/
+        src_tgt/
+          src/*.npy
+          tgt/*.npy
+        ...
+
+    返回（__getitem__ return）:
+      imgs_dict: { src_domain: tensor(4,H,W), tgt_domain: tensor(4,H,W) }
+      meta: { 'src': src_domain, 'tgt': tgt_domain, 'filename': fname }
+    """
+    def __init__(self, root: str, transform=None):
         self.root = Path(root)
-        self.domains = domains
         self.transform = transform
-        self.dirs = [self.root / d for d in domains]
+        if not self.root.exists():
+            raise FileNotFoundError(f"Test root not found: {root}")
 
-        sets = [set(p.name for p in d.glob("*.npy")) for d in self.dirs]
-        common = sorted(set.intersection(*sets))
+        samples = []
+        for pair_dir in sorted(p for p in self.root.iterdir() if p.is_dir()):
+            try:
+                src_domain, tgt_domain = _parse_pair_dir_name(pair_dir.name)
+            except ValueError:
+                # 跳过非 pair 目录（skip non-pair dirs）
+                continue
+            src_dir = pair_dir / src_domain
+            tgt_dir = pair_dir / tgt_domain
+            if not (src_dir.is_dir() and tgt_dir.is_dir()):
+                continue
 
-        if not common:
-            raise RuntimeError(f"No common .npy among {domains}")
+            # 同名交集（common filenames）
+            src_names = set(f.name for f in src_dir.glob('*.npy'))
+            tgt_names = set(f.name for f in tgt_dir.glob('*.npy'))
+            common = sorted(src_names & tgt_names)
+            for fname in common:
+                samples.append((src_domain, tgt_domain, src_dir/fname, tgt_dir/fname, fname))
 
-        self.pairs = [
-            [d / fname for d in self.dirs]
-            for fname in common
-        ]
-        self.filenames=common
+        if not samples:
+            raise RuntimeError(f"No paired .npy found under {root} with pairwise layout.")
+        self.samples = samples
+
+        # 用于分组采样的键（pair key for grouping）
+        self.pair_keys = [f"{s}->{t}" for (s, t, _, _, _) in self.samples]
 
     def __len__(self):
-        return len(self.filenames)
+        return len(self.samples)
 
-    def __getitem__(self, idx):
-        paths = self.pairs[idx]
-        imgs = {}
-        for domain, p in zip(self.domains, paths):
-            arr = np.load(str(p)) # (4, H, W)
-            img = torch.from_numpy(arr).float()
-            if self.transform:
-                img = self.transform(img)
-            imgs[domain] = img
-        return imgs, self.filenames[idx]
-
+    def __getitem__(self, idx: int):
+        src_domain, tgt_domain, p_src, p_tgt, fname = self.samples[idx]
+        arr_src = np.load(str(p_src))  # (4,H,W)
+        arr_tgt = np.load(str(p_tgt))
+        img_src = torch.from_numpy(arr_src).float()
+        img_tgt = torch.from_numpy(arr_tgt).float()
+        if self.transform is not None:
+            img_src = self.transform(img_src)
+            img_tgt = self.transform(img_tgt)
+        imgs = {src_domain: img_src, tgt_domain: img_tgt}
+        meta = {'src': src_domain, 'tgt': tgt_domain, 'filename': fname}
+        return imgs, meta
 
 def _make_balanced_sampler(labels):
     class_counts = np.bincount(labels)
@@ -201,26 +234,65 @@ def get_train_loader(root, which='source', img_size=256,
                                pin_memory=True,
                                drop_last=True)
 
-def get_test_loader(root, domains, img_size=256, batch_size=32,
-                    shuffle=False, num_workers=4):
-    print('Preparing DataLoader for the generation phase (4-ch npy)...')
+from collections import defaultdict
+
+def get_test_loader_pairdirs(root, img_size=256, batch_size=32,
+                             shuffle=False, num_workers=4):
+    """
+    新版测试 Loader（pairwise folders + grouped batch sampler）
+    - 保证每个 batch 只包含同一对 (src, tgt)
+    - 返回 (imgs_dict, meta)，其中 imgs_dict 仅含该对域名的两键
+    """
+    print('Preparing DataLoader for test (pairwise folders, grouped batches, 4-ch npy)...')
+
     transform = transforms.Compose([
         transforms.Resize([img_size, img_size]),
         transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
                              std =[0.5, 0.5, 0.5, 0.5]),
     ])
+    ds = PairDirsPairedNpyDataset(root=root, transform=transform)
 
-    paired_ds = PairedNpyDataset(
-        root=root,
-        domains=domains,
-        transform=transform
-    )
+    pair2idxs = defaultdict(list)
+    for idx, key in enumerate(ds.pair_keys):
+        pair2idxs[key].append(idx)
 
-    return data.DataLoader(dataset=paired_ds,
-                      batch_size=batch_size,
-                      shuffle=shuffle,
-                      num_workers=num_workers,
-                      pin_memory=True)
+    batches = []
+    for key, idxs in pair2idxs.items():
+        for i in range(0, len(idxs), batch_size):
+            batches.append(idxs[i:i+batch_size])
+
+    class _PairBatchSampler(torch.utils.data.Sampler):
+        def __init__(self, batches):
+            self.batches = batches
+
+        def __iter__(self):
+            for b in self.batches:
+                yield b
+
+        def __len__(self):
+            return len(self.batches)
+
+    def _collate(batch):
+        src = batch[0][1]['src']
+        tgt = batch[0][1]['tgt']
+        src_imgs = [item[0][src] for item in batch]
+        tgt_imgs = [item[0][tgt] for item in batch]
+        imgs_dict = {
+            src: torch.stack(src_imgs, 0),
+            tgt: torch.stack(tgt_imgs, 0),
+        }
+        meta = {
+            'src': [src]*len(batch),
+            'tgt': [tgt]*len(batch),
+            'filename': [item[1]['filename'] for item in batch],
+        }
+        return imgs_dict, meta
+
+    return data.DataLoader(dataset=ds,
+                        batch_sampler=_PairBatchSampler(batches),
+                        num_workers=num_workers,
+                        pin_memory=True,
+                        collate_fn=_collate)
 
 class InputFetcher:
     def __init__(self, loader, loader_ref=None, mode=''):

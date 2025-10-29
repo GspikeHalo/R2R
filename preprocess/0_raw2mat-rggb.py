@@ -196,11 +196,12 @@ def fit_cover_center_crop_downsample_only(raw_rggb: np.ndarray, tw: int, th: int
 
 # pair_data = ['paired/', 'unpaired/']
 # cameras   = ['huawei/', 'nikon/', 'canon/', 'iphone/', 'samsung/']
-BASE_DIR   = '/media/Data_2/r2r_odb_v2/'
-RESULT_DIR = '/media/Data_2/R2RResult/r2r-odb-v2'
+BASE_DIR   = '/media/Data_2/r2r_odb_v2'
+RESULT_DIR = '/media/Data_2/R2RResult/odb-full-paired-rggb'
 
-pair_data = ['paired/', 'unpaired/']
-cameras   = ['huawei/', 'nikon/']
+pair_data = ['unpaired/']
+# cameras   = ['huawei/', 'nikon/']
+cameras   = ['huawei/', 'nikon/', 'canon/', 'iphone/', 'samsung/']
 
 postfix_map = {
     'huawei/': '_A',
@@ -228,10 +229,10 @@ camera_meta = {
 # 方向矫正 / Orientation per camera
 ORIENT_PER_CAMERA = {
     'huawei/':  'none',
-    'nikon/':   'hflip',
+    'nikon/':   'rot180',
     'iphone/':  'none',
     'samsung/': 'none',
-    'canon/':   'hflip'
+    'canon/':   'rot180'
 }
 
 # ---------------------------

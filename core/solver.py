@@ -13,6 +13,7 @@ from os.path import join as ospj
 import time
 import datetime
 from munch import Munch
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -25,7 +26,7 @@ from core.data_loader import InputFetcher
 import core.utils as utils
 from tqdm import tqdm
 from torchvision.utils import save_image
-from collections import defaultdict
+from torchvision import transforms
 
 import wandb
 
@@ -36,7 +37,7 @@ class Solver(nn.Module):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         self.nets, self.nets_ema = build_model(args)
-        # below setattrs are to make networks be children of Solver, e.g., for self.to(self.device)
+        # register submodules as children
         for name, module in self.nets.items():
             utils.print_network(module, name)
             setattr(self, name, module)
@@ -69,7 +70,8 @@ class Solver(nn.Module):
             self.ckptios = [
                 CheckpointIO(ospj(args.checkpoint_dir, '{:06d}_nets.ckpt'), data_parallel=True, **self.nets),
                 CheckpointIO(ospj(args.checkpoint_dir, '{:06d}_nets_ema.ckpt'), data_parallel=True, **self.nets_ema),
-                CheckpointIO(ospj(args.checkpoint_dir, '{:06d}_optims.ckpt'), **self.optims)]
+                CheckpointIO(ospj(args.checkpoint_dir, '{:06d}_optims.ckpt'), **self.optims)
+            ]
 
             self.best_ckptios = [
                 CheckpointIO(os.path.join(args.checkpoint_dir, 'best_nets.ckpt'), data_parallel=True, **self.nets),
@@ -94,6 +96,16 @@ class Solver(nn.Module):
                 print('Initializing %s...' % name)
                 network.apply(utils.he_init)
 
+        self.ref_transform = transforms.Compose([
+            transforms.Resize([self.args.img_size, self.args.img_size]),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5, 0.5],
+                                 std =[0.5, 0.5, 0.5, 0.5]),
+        ])
+
+        # {domain: [(abs_path, mean_vec[4]), ...]}
+        self.val_ref_pool_cmeans = None
+
+    # ---------------- utils ----------------
     def _save_checkpoint(self, step):
         for ckptio in self.ckptios:
             ckptio.save(step)
@@ -107,13 +119,104 @@ class Solver(nn.Module):
             optim.zero_grad()
 
     def denorm(self, x):
-        """Convert the range from [-1, 1] to [0, 1]."""
+        # [-1,1] -> [0,1]
         out = (x + 1) / 2
         return out.clamp_(0, 1)
 
     def rggb2rgb(self, img):
         r, gr, gb, b = img[0], img[1], img[2], img[3]
         return torch.stack([r, 0.5 * (gr + gb), b], 0)
+
+    def _to01(self, x_m11: torch.Tensor) -> torch.Tensor:
+        return x_m11.mul(0.5).add(0.5).clamp(0, 1)
+
+    def _channel_means(self, x_m11: torch.Tensor) -> torch.Tensor:
+        """
+        输入：[-1,1]，形状 [4,H,W] 或 [1,4,H,W]
+        输出：通道均值向量 [4] in [0,1]（R, GR, GB, B）
+        """
+        if x_m11.dim() == 4 and x_m11.size(0) == 1:
+            x_m11 = x_m11[0]
+        x01 = self._to01(x_m11)
+        return x01.view(4, -1).mean(dim=1).cpu()
+
+    def _build_val_ref_pool_by_cmeans(self, root_dir: str):
+        """
+        Build ref pool for each domain.
+        Support:
+          A) flat:  root/<domain>/*.npy
+          B) pair:  root/<a>_<b>/<a>/*.npy and .../<b>/*.npy
+        """
+        root_p = os.path.abspath(self.args.val_img_dir if root_dir is None else root_dir)
+        pool = {}
+        for entry in sorted(os.listdir(root_p)):
+            dpath = os.path.join(root_p, entry)
+            if not os.path.isdir(dpath):
+                continue
+            if '_' in entry:  # pair-dirs
+                # expect dpath/<left>/ and dpath/<right>/
+                for sub in sorted(os.listdir(dpath)):
+                    subdir = os.path.join(dpath, sub)
+                    if not os.path.isdir(subdir):
+                        continue
+                    domain = sub
+                    items = pool.setdefault(domain, [])
+                    for fn in sorted(os.listdir(subdir)):
+                        if not fn.endswith('.npy'):
+                            continue
+                        pth = os.path.join(subdir, fn)
+                        arr = np.load(pth)
+                        ten = torch.from_numpy(arr).float()
+                        ten = self.ref_transform(ten)  # [-1,1]
+                        mv = self._channel_means(ten)  # [4] cpu
+                        items.append((os.path.abspath(pth), mv, fn))  # 追加 basename 便于排除
+            else:  # flat
+                domain = entry
+                if not os.path.isdir(dpath):
+                    continue
+                items = pool.setdefault(domain, [])
+                for fn in sorted(os.listdir(dpath)):
+                    if not fn.endswith('.npy'):
+                        continue
+                    pth = os.path.join(dpath, fn)
+                    arr = np.load(pth)
+                    ten = torch.from_numpy(arr).float()
+                    ten = self.ref_transform(ten)
+                    mv = self._channel_means(ten)
+                    items.append((os.path.abspath(pth), mv, fn))
+        self.val_ref_pool_cmeans = pool
+
+    def _select_ref_by_cmeans(self, domain: str, target_vec: torch.Tensor,
+                              exclude_name: str | None) -> torch.Tensor | None:
+        """
+        Pick single ref in `domain` by L2 on channel means.
+        exclude_name: 文件名（basename）用于排除同名；若 None 不排除。
+        Return tensor [4,H,W] in [-1,1]; 若无候选返回 None。
+        """
+        assert self.val_ref_pool_cmeans is not None, "call _build_val_ref_pool_by_cmeans first."
+        cands_full = self.val_ref_pool_cmeans.get(domain, [])
+        if not cands_full:
+            return None
+
+        # 先按 basename 排除
+        if exclude_name is not None:
+            cands = [(p, m) for (p, m, fn) in cands_full if fn != exclude_name]
+        else:
+            cands = [(p, m) for (p, m, fn) in cands_full]
+
+        # 若排除后没有候选，则放宽排除
+        if not cands:
+            cands = [(p, m) for (p, m, fn) in cands_full]
+
+        if not cands:
+            return None
+
+        tv = target_vec.cpu()
+        p_sel, _ = min(cands, key=lambda t: torch.linalg.norm(t[1] - tv).item())
+        arr = np.load(p_sel)
+        ten = torch.from_numpy(arr).float()
+        ten = self.ref_transform(ten)
+        return ten
 
     def _noise_loss_batch(self, x_fake, y_trg):
         if (self.noise_losses is None) or (self.args.lambda_noise <= 0):
@@ -130,6 +233,7 @@ class Solver(nn.Module):
                 used += 1
         return tot / max(used, 1)
 
+    # ---------------- train ----------------
     def train(self, loaders):
         args = self.args
         nets = self.nets
@@ -139,7 +243,7 @@ class Solver(nn.Module):
         # fetch random validation images for debugging
         fetcher = InputFetcher(loaders.src, loaders.ref, 'train')
         fetcher_val = InputFetcher(loaders.val, None, 'val')
-        inputs_val = next(fetcher_val)
+        _ = next(fetcher_val)
 
         # resume training if necessary
         if args.resume_iter > 0:
@@ -172,15 +276,15 @@ class Solver(nn.Module):
             optims.generator.step()
             optims.style_encoder.step()
 
-            # compute moving average of network parameters
+            # EMA
             moving_average(nets.generator, nets_ema.generator, beta=0.999)
             moving_average(nets.style_encoder, nets_ema.style_encoder, beta=0.999)
 
-            # decay weight for diversity sensitive loss
+            # decay lambda_ds
             if args.lambda_ds > 0:
                 args.lambda_ds -= (initial_lambda_ds / args.ds_iter)
 
-            # print out log info
+            # logs
             if (i+1) % args.print_every == 0:
                 elapsed = time.time() - start_time
                 elapsed = str(datetime.timedelta(seconds=elapsed))[:-7]
@@ -197,7 +301,7 @@ class Solver(nn.Module):
                 if args.use_wandb:
                     wandb.log(all_losses, step=i+1)
 
-            # generate images for debugging
+            # sample
             if (i+1) % args.sample_every == 0:
                 step = i+1
                 os.makedirs(args.sample_dir, exist_ok=True)
@@ -223,17 +327,14 @@ class Solver(nn.Module):
                             if mask.sum() == 0:
                                 continue
                             x_ref_pool = x_ref_all[mask]
-                            K = x_ref_pool.size(0)
-
-                            if K < B:
-                                idx = torch.randint(low=0, high=K, size=(B,), device=x_ref_pool.device)
-                                x_ref_d = x_ref_pool[idx]
-                            elif K > B:
-                                idx = torch.randperm(K, device=x_ref_pool.device)[:B]
-                                x_ref_d = x_ref_pool[idx]
+                            Kp = x_ref_pool.size(0)
+                            if Kp < B:
+                                idx = torch.randint(low=0, high=Kp, size=(B,), device=x_ref_pool.device)
+                            elif Kp > B:
+                                idx = torch.randperm(Kp, device=x_ref_pool.device)[:B]
                             else:
-                                x_ref_d = x_ref_pool
-
+                                idx = torch.arange(B, device=x_ref_pool.device)
+                            x_ref_d = x_ref_pool[idx]
                             c_t = torch.full((B,), domain, dtype=torch.long, device=x_fixed.device)
                             s_t = nets_ema.style_encoder(x_ref_d, c_t)
                             x_fake = nets_ema.generator(x_fixed, s_t)
@@ -248,7 +349,7 @@ class Solver(nn.Module):
                 if args.use_wandb and imgs_to_log:
                     wandb.log({"val/fixed_samples": imgs_to_log}, step=step)
 
-            # save model checkpoints
+            # save checkpoints
             if (i + 1) % args.save_every == 0:
                 step = i + 1
                 for fn in os.listdir(self.args.checkpoint_dir):
@@ -257,7 +358,7 @@ class Solver(nn.Module):
                 self._save_checkpoint(step=step)
                 print(f"⇒ Saved checkpoint for iter {step}, old step files have been removed.")
 
-            # # compute FID and LPIPS if necessary
+            # eval
             if (i+1) % args.eval_every == 0:
                 print(f"\n===Iter {i+1}: running test() ===")
                 current_mae = self.test(step=i+1)
@@ -271,38 +372,38 @@ class Solver(nn.Module):
     @torch.no_grad()
     def test(self, step=None):
         """
-        Zero-shot / 无 k-shot：
-        不使用参考图像；用映射网络 mapping_network_ema(z, y) 生成风格向量 s。
-        评测同时保存：
-          - 正向四联图: [src, fake, tgt, diff(fake,tgt)]
-          - 反向四联图: [tgt, fake_rev, src, diff(fake_rev,src)]
-          - 单张生成图: fake / fake_rev
+        PairDirs eval + brightness-matched refs from TEST set:
+        - 每个 batch 仅含单一 (src,tgt) 对
+        - 参考图像：在 test_img_dir(若无则 val_img_dir) 的目标/源域中按通道均值 L2 最接近选择（排除同名）
+        - 保存四联图 (src/ref/fake/tgt) 与单张生成图
         """
         if step is None:
             step = self.args.resume_iter
 
-        # 需要 EMA 的映射网络
-        if not hasattr(self, 'mapping_network_ema'):
-            raise AttributeError(
-                "mapping_network_ema not found. Ensure build_model() returns mapping_network and EMA is registered.")
-
+        # ---- load & eval ----
         self._load_checkpoint(step)
         self.generator_ema.eval()
         self.style_encoder_ema.eval()
-        self.mapping_network_ema.eval()
 
+        # ---- reference pool from TEST (fallback to VAL) ----
+        ref_root = getattr(self.args, 'test_img_dir', None) or self.args.val_img_dir
+        self._build_val_ref_pool_by_cmeans(ref_root)  # 已支持 flat 与 pair-dirs
+
+        # ---- io dirs ----
         os.makedirs(self.args.result_dir, exist_ok=True)
         trip_dir = os.path.join(self.args.result_dir, "triptychs")
         fake_root = os.path.join(self.args.result_dir, "fakes_by_target")
         os.makedirs(trip_dir, exist_ok=True)
         os.makedirs(fake_root, exist_ok=True)
 
-        # —— 用“训练集”的域顺序，保证与训练时索引一致 —— #
-        train_domains = sorted([d for d in os.listdir(self.args.train_img_dir)
-                                if os.path.isdir(os.path.join(self.args.train_img_dir, d))])
+        # ---- domain index: use TRAIN single-domain dirs (consistent with training) ----
+        train_domains = sorted(
+            d for d in os.listdir(self.args.train_img_dir)
+            if os.path.isdir(os.path.join(self.args.train_img_dir, d))
+        )
         domain2idx = {d: i for i, d in enumerate(train_domains)}
 
-        # metrics helpers
+        # ---- metrics helpers ----
         def _psnr(x, y, max_val=1.0, eps=1e-10):
             mse = ((x - y) ** 2).mean(dim=[1, 2, 3])
             return 10 * torch.log10(max_val ** 2 / (mse + eps))
@@ -327,33 +428,27 @@ class Solver(nn.Module):
                 out[i] = torch.stack(kls).mean()
             return out  # [B]
 
-        # 可视化辅助
-        def _diff_rgb(x_den, y_den):
-            """|x-y| 的通道均值灰度 -> 3 通道 RGB 可视化，值域已在 [0,1]"""
-            d = (x_den - y_den).abs().mean(dim=1, keepdim=True)  # [B,1,H,W]
-            return d.repeat(1, 3, 1, 1)
-
         ssim_fn = SSIM(data_range=1.0, channel=4, size_average=False).to(self.device)
         kl_bins = int(getattr(self.args, 'kl_bins', 256))
-        latent_dim = int(getattr(self.args, 'latent_dim', 16))  # 映射网络输入维度
 
-        # accumulators
-        tot = {}  # key -> dict(mae, psnr, ssim, kl, count)
+        # ---- accumulators ----
+        tot = {}  # key: "a->b" -> {mae, psnr, ssim, kl, count}
 
-        from tqdm import tqdm
+        # ---- loop over batches (each is a single pair) ----
         for batch_i, (imgs_dict, meta) in enumerate(tqdm(self.test_loader, desc="Testing")):
-            # 每个 batch 只含一对域
             src = meta['src'][0]
             tgt = meta['tgt'][0]
             key_fwd = f"{src}->{tgt}"
             key_rev = f"{tgt}->{src}"
 
             if (src not in domain2idx) or (tgt not in domain2idx):
-                # 测试域未在训练中出现，跳过
-                continue
+                continue  # unseen domain in training, skip
 
-            x_src = imgs_dict[src].to(self.device)  # [B,4,H,W]
-            x_tgt = imgs_dict[tgt].to(self.device)  # [B,4,H,W]
+            # move to device
+            imgs_dict[src] = imgs_dict[src].to(self.device)
+            imgs_dict[tgt] = imgs_dict[tgt].to(self.device)
+            x_src = imgs_dict[src]  # [B,4,H,W]
+            x_tgt = imgs_dict[tgt]  # [B,4,H,W]
             B = x_src.size(0)
             if B == 0:
                 continue
@@ -361,76 +456,110 @@ class Solver(nn.Module):
             y_src = torch.full((B,), domain2idx[src], device=self.device, dtype=torch.long)
             y_tgt = torch.full((B,), domain2idx[tgt], device=self.device, dtype=torch.long)
 
-            # ---------- forward: src -> tgt（零参考，用随机 z_t） ----------
-            z_t = torch.randn(B, latent_dim, device=self.device)
-            s_t = self.mapping_network_ema(z_t, y_tgt)  # [B, style_dim]
-            x_fake = self.generator_ema(x_src, s_t, y_org=y_src, c_t=y_tgt)
+            # filenames for exclude (basename)
+            fnames = meta['filename'] if isinstance(meta['filename'], (list, tuple)) else [meta['filename']] * B
+            base_names = [os.path.basename(f) for f in fnames]
 
-            x_fake_den = self.denorm(x_fake)  # [0,1]
-            x_tgt_den = self.denorm(x_tgt)  # [0,1]
-            x_src_den = self.denorm(x_src)  # [0,1]
+            # ---------- forward: src -> tgt (ref from TEST tgt by brightness) ----------
+            do_forward = True
+            refs_t = []
+            for b in range(B):
+                tvec = self._channel_means(x_tgt[b])  # [-1,1] -> cmeans in [0,1]
+                ref = self._select_ref_by_cmeans(tgt, tvec, base_names[b])  # 可能返回 None
+                if ref is None:
+                    # 兜底：B>1 用批内错位；否则跳过该方向
+                    if B > 1:
+                        ref = x_tgt[(b + 1) % B].detach()  # 已是 [-1,1]
+                    else:
+                        do_forward = False
+                        break
+                refs_t.append(ref)
+            if do_forward:
+                x_ref_t = torch.stack(refs_t, dim=0).to(self.device)  # [B,4,H,W]
 
-            mae_f = torch.abs(x_fake_den - x_tgt_den).view(B, -1).mean(dim=1).sum().item()
-            psnr_f = _psnr(x_fake_den, x_tgt_den).sum().item()
-            ssim_f = ssim_fn(x_fake_den, x_tgt_den).sum().item()
-            kl_f = _sym_kl_hist(x_fake_den, x_tgt_den, bins=kl_bins).sum().item()
+                s_t = self.style_encoder_ema(x_ref_t, y_tgt)
+                x_fake = self.generator_ema(x_src, s_t, y_org=y_src, c_t=y_tgt)
 
-            if key_fwd not in tot:
-                tot[key_fwd] = {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
-            tot[key_fwd]["mae"] += mae_f
-            tot[key_fwd]["psnr"] += psnr_f
-            tot[key_fwd]["ssim"] += ssim_f
-            tot[key_fwd]["kl"] += kl_f
-            tot[key_fwd]["count"] += B
+                x_fake_den = self.denorm(x_fake)
+                x_tgt_den = self.denorm(x_tgt)
+                x_src_den = self.denorm(x_src)
 
-            # —— 保存正向四联图与单张 fake —— #
-            src_rgb = self.rggb2rgb(x_src_den[0])
-            fake_rgb = self.rggb2rgb(x_fake_den[0])
-            tgt_rgb = self.rggb2rgb(x_tgt_den[0])
-            diff_rgb = _diff_rgb(x_fake_den, x_tgt_den)[0]  # 3ch
-            panel_fwd = torch.stack([src_rgb, fake_rgb, tgt_rgb, diff_rgb], 0)  # [4,3,H,W]
-            save_image(panel_fwd, os.path.join(trip_dir, f"{src}2{tgt}_batch{batch_i}.png"), nrow=4)
-            os.makedirs(os.path.join(fake_root, tgt), exist_ok=True)
-            save_image(fake_rgb, os.path.join(fake_root, tgt, f"{src}2{tgt}_batch{batch_i}_fake.png"))
+                mae_f = torch.abs(x_fake_den - x_tgt_den).view(B, -1).mean(dim=1).sum().item()
+                psnr_f = _psnr(x_fake_den, x_tgt_den).sum().item()
+                ssim_f = ssim_fn(x_fake_den, x_tgt_den).sum().item()
+                kl_f = _sym_kl_hist(x_fake_den, x_tgt_den, bins=kl_bins).sum().item()
 
-            # ---------- reverse: tgt -> src（零参考，用随机 z_s） ----------
-            z_s = torch.randn(B, latent_dim, device=self.device)
-            s_s = self.mapping_network_ema(z_s, y_src)
-            x_fake_rev = self.generator_ema(x_tgt, s_s, y_org=y_tgt, c_t=y_src)
+                if key_fwd not in tot:
+                    tot[key_fwd] = {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
+                tot[key_fwd]["mae"] += mae_f
+                tot[key_fwd]["psnr"] += psnr_f
+                tot[key_fwd]["ssim"] += ssim_f
+                tot[key_fwd]["kl"] += kl_f
+                tot[key_fwd]["count"] += B
 
-            x_fake_rev_den = self.denorm(x_fake_rev)
-            x_src_den = self.denorm(x_src)
+                # save 4-panel and single fake (forward)
+                b0 = 0
+                src_rgb = self.rggb2rgb(x_src_den[b0])
+                ref_rgb = self.rggb2rgb(self.denorm(x_ref_t)[b0])
+                fake_rgb = self.rggb2rgb(x_fake_den[b0])
+                tgt_rgb = self.rggb2rgb(x_tgt_den[b0])
+                panel = torch.stack([src_rgb, ref_rgb, fake_rgb, tgt_rgb], 0)
+                save_image(panel, os.path.join(trip_dir, f"{src}2{tgt}_batch{batch_i}.png"), nrow=4)
+                os.makedirs(os.path.join(fake_root, tgt), exist_ok=True)
+                save_image(fake_rgb, os.path.join(fake_root, tgt, f"{src}2{tgt}_batch{batch_i}_fake.png"))
 
-            mae_r = torch.abs(x_fake_rev_den - x_src_den).view(B, -1).mean(dim=1).sum().item()
-            psnr_r = _psnr(x_fake_rev_den, x_src_den).sum().item()
-            ssim_r = ssim_fn(x_fake_rev_den, x_src_den).sum().item()
-            kl_r = _sym_kl_hist(x_fake_rev_den, x_src_den, bins=kl_bins).sum().item()
+            # ---------- reverse: tgt -> src (ref from TEST src by brightness) ----------
+            do_reverse = True
+            refs_s = []
+            for b in range(B):
+                tvec = self._channel_means(x_src[b])
+                ref = self._select_ref_by_cmeans(src, tvec, base_names[b])
+                if ref is None:
+                    if B > 1:
+                        ref = x_src[(b + 1) % B].detach()
+                    else:
+                        do_reverse = False
+                        break
+                refs_s.append(ref)
+            if do_reverse:
+                x_ref_s = torch.stack(refs_s, dim=0).to(self.device)
 
-            if key_rev not in tot:
-                tot[key_rev] = {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
-            tot[key_rev]["mae"] += mae_r
-            tot[key_rev]["psnr"] += psnr_r
-            tot[key_rev]["ssim"] += ssim_r
-            tot[key_rev]["kl"] += kl_r
-            tot[key_rev]["count"] += B
+                s_s = self.style_encoder_ema(x_ref_s, y_src)
+                x_fake_rev = self.generator_ema(x_tgt, s_s, y_org=y_tgt, c_t=y_src)
 
-            # —— 保存反向四联图与单张 fake_rev —— #
-            tgt_rgb_r = self.rggb2rgb(self.denorm(x_tgt)[0])
-            fake_rev_rgb = self.rggb2rgb(x_fake_rev_den[0])
-            src_rgb_r = self.rggb2rgb(x_src_den[0])
-            diff_rev_rgb = _diff_rgb(x_fake_rev_den, x_src_den)[0]
-            panel_rev = torch.stack([tgt_rgb_r, fake_rev_rgb, src_rgb_r, diff_rev_rgb], 0)
-            save_image(panel_rev, os.path.join(trip_dir, f"{tgt}2{src}_batch{batch_i}.png"), nrow=4)
-            os.makedirs(os.path.join(fake_root, src), exist_ok=True)
-            save_image(fake_rev_rgb, os.path.join(fake_root, src, f"{tgt}2{src}_batch{batch_i}_fake.png"))
+                x_fake_rev_den = self.denorm(x_fake_rev)
+                x_src_den = self.denorm(x_src)
 
-        # per-direction
+                mae_r = torch.abs(x_fake_rev_den - x_src_den).view(B, -1).mean(dim=1).sum().item()
+                psnr_r = _psnr(x_fake_rev_den, x_src_den).sum().item()
+                ssim_r = ssim_fn(x_fake_rev_den, x_src_den).sum().item()
+                kl_r = _sym_kl_hist(x_fake_rev_den, x_src_den, bins=kl_bins).sum().item()
+
+                if key_rev not in tot:
+                    tot[key_rev] = {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
+                tot[key_rev]["mae"] += mae_r
+                tot[key_rev]["psnr"] += psnr_r
+                tot[key_rev]["ssim"] += ssim_r
+                tot[key_rev]["kl"] += kl_r
+                tot[key_rev]["count"] += B
+
+                # save 4-panel and single fake (reverse)
+                tgt_rgb_r = self.rggb2rgb(self.denorm(x_tgt)[b0])
+                ref_rev_rgb = self.rggb2rgb(self.denorm(x_ref_s)[b0])
+                fake_rev_rgb = self.rggb2rgb(x_fake_rev_den[b0])
+                src_rgb_r = self.rggb2rgb(self.denorm(x_src)[b0])
+                panel_r = torch.stack([tgt_rgb_r, ref_rev_rgb, fake_rev_rgb, src_rgb_r], 0)
+                save_image(panel_r, os.path.join(trip_dir, f"{tgt}2{src}_batch{batch_i}.png"), nrow=4)
+                os.makedirs(os.path.join(fake_root, src), exist_ok=True)
+                save_image(fake_rev_rgb, os.path.join(fake_root, src, f"{tgt}2{src}_batch{batch_i}_fake.png"))
+
+        # ---- per-direction report ----
         for key, v in tot.items():
             cnt = max(1, v["count"])
             print(f"{key}  MAE:{v['mae'] / cnt:.4f} PSNR:{v['psnr'] / cnt:.2f} "
                   f"SSIM:{v['ssim'] / cnt:.4f} KL:{v['kl'] / cnt:.6f}")
 
-        # global averages
+        # ---- micro-average over all ----
         total_mae = sum(v["mae"] for v in tot.values())
         total_psnr = sum(v["psnr"] for v in tot.values())
         total_ssim = sum(v["ssim"] for v in tot.values())
@@ -444,6 +573,7 @@ class Solver(nn.Module):
 
         print(f"Avg all  MAE:{avg_mae:.4f} PSNR:{avg_psnr:.2f} SSIM:{avg_ssim:.4f} KL:{avg_kl:.6f}")
 
+        # ---- wandb ----
         if self.args.use_wandb:
             metrics = {}
             for key, v in tot.items():
@@ -460,6 +590,8 @@ class Solver(nn.Module):
 
         return avg_mae
 
+
+# ---------------- losses & helpers ----------------
 def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref):
     assert x_ref is not None
 
@@ -478,6 +610,7 @@ def compute_d_loss(nets, args, x_real, y_org, y_trg, x_ref):
     return loss, Munch(real=loss_real.item(),
                        fake=loss_fake.item(),
                        reg=loss_reg.item())
+
 
 def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None, ssim_fn=None):
     x_ref, x_ref2 = x_refs
@@ -542,8 +675,9 @@ def compute_g_loss(nets, args, x_real, y_org, y_trg, x_refs, noise_loss_fn=None,
         noise=loss_noise.item(),
         id=loss_id.item(),
         cyc_ssim=(loss_cyc_ssim.item() if torch.is_tensor(loss_cyc_ssim) else 0.0),
-        id_ssim=(loss_id_ssim.item() if torch.is_tensor(loss_id_ssim) else 0.0)
+        id_ssim=(loss_id_ssim.item() if torch.is_tensor(loss_id_ssim) else 0.0),
     )
+
 
 def moving_average(model, model_test, beta=0.999):
     for param, param_test in zip(model.parameters(), model_test.parameters()):

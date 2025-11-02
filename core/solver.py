@@ -80,7 +80,7 @@ class Solver(nn.Module):
             ]
 
             self.best_mae = float('inf')
-            self.ssim_train = SSIM(data_range=1.0, channel=4, size_average=True).to(self.device)
+            self.ssim_train = SSIM(data_range=2.0, channel=4, size_average=True).to(self.device)
         else:
             if self.args.best_model:
                 ema_template = os.path.join(self.args.checkpoint_dir, 'best_nets_ema.ckpt')
@@ -385,18 +385,22 @@ class Solver(nn.Module):
         self.generator_ema.eval()
         self.style_encoder_ema.eval()
 
-        # ---- reference pool from TEST (fallback to VAL) ----
+        # ---- visualize only in eval mode｜仅 eval 模式落盘可视化 ----
+        save_vis = (getattr(self.args, 'mode', '') == 'eval')
+        if save_vis:
+            os.makedirs(self.args.result_dir, exist_ok=True)
+            trip_dir  = os.path.join(self.args.result_dir, "triptychs")
+            fake_root = os.path.join(self.args.result_dir, "fakes_by_target")
+            os.makedirs(trip_dir, exist_ok=True)
+            os.makedirs(fake_root, exist_ok=True)
+        else:
+            trip_dir, fake_root = None, None
+
+        # ---- build ref pool from TEST (fallback to VAL)｜参考池来源：优先 test_img_dir，否则 val_img_dir ----
         ref_root = getattr(self.args, 'test_img_dir', None) or self.args.val_img_dir
-        self._build_val_ref_pool_by_cmeans(ref_root)  # 已支持 flat 与 pair-dirs
+        self._build_val_ref_pool_by_cmeans(ref_root)  # 已实现：同时支持 flat 与 pair-dirs
 
-        # ---- io dirs ----
-        os.makedirs(self.args.result_dir, exist_ok=True)
-        trip_dir = os.path.join(self.args.result_dir, "triptychs")
-        fake_root = os.path.join(self.args.result_dir, "fakes_by_target")
-        os.makedirs(trip_dir, exist_ok=True)
-        os.makedirs(fake_root, exist_ok=True)
-
-        # ---- domain index: use TRAIN single-domain dirs (consistent with training) ----
+        # ---- domain index from TRAIN｜与训练一致的域索引 ----
         train_domains = sorted(
             d for d in os.listdir(self.args.train_img_dir)
             if os.path.isdir(os.path.join(self.args.train_img_dir, d))
@@ -432,19 +436,21 @@ class Solver(nn.Module):
         kl_bins = int(getattr(self.args, 'kl_bins', 256))
 
         # ---- accumulators ----
-        tot = {}  # key: "a->b" -> {mae, psnr, ssim, kl, count}
+        tot = {}  # key -> dict(mae, psnr, ssim, kl, count)
 
-        # ---- loop over batches (each is a single pair) ----
+        # ---- loop over test loader ----
         for batch_i, (imgs_dict, meta) in enumerate(tqdm(self.test_loader, desc="Testing")):
+            # 单对域名｜single pair per batch
             src = meta['src'][0]
             tgt = meta['tgt'][0]
             key_fwd = f"{src}->{tgt}"
             key_rev = f"{tgt}->{src}"
 
+            # 训练未见域直接跳过｜skip unseen domains
             if (src not in domain2idx) or (tgt not in domain2idx):
-                continue  # unseen domain in training, skip
+                continue
 
-            # move to device
+            # tensors
             imgs_dict[src] = imgs_dict[src].to(self.device)
             imgs_dict[tgt] = imgs_dict[tgt].to(self.device)
             x_src = imgs_dict[src]  # [B,4,H,W]
@@ -456,7 +462,7 @@ class Solver(nn.Module):
             y_src = torch.full((B,), domain2idx[src], device=self.device, dtype=torch.long)
             y_tgt = torch.full((B,), domain2idx[tgt], device=self.device, dtype=torch.long)
 
-            # filenames for exclude (basename)
+            # filenames (for exclude by basename)｜用文件名排除同名参考
             fnames = meta['filename'] if isinstance(meta['filename'], (list, tuple)) else [meta['filename']] * B
             base_names = [os.path.basename(f) for f in fnames]
 
@@ -464,56 +470,55 @@ class Solver(nn.Module):
             do_forward = True
             refs_t = []
             for b in range(B):
-                tvec = self._channel_means(x_tgt[b])  # [-1,1] -> cmeans in [0,1]
-                ref = self._select_ref_by_cmeans(tgt, tvec, base_names[b])  # 可能返回 None
+                tvec = self._channel_means(x_tgt[b])                       # [-1,1] → 均值[0,1]
+                ref  = self._select_ref_by_cmeans(tgt, tvec, base_names[b])  # 可能 None
                 if ref is None:
-                    # 兜底：B>1 用批内错位；否则跳过该方向
                     if B > 1:
-                        ref = x_tgt[(b + 1) % B].detach()  # 已是 [-1,1]
+                        ref = x_tgt[(b + 1) % B].detach()                  # 批内错位 fallback
                     else:
                         do_forward = False
                         break
                 refs_t.append(ref)
             if do_forward:
-                x_ref_t = torch.stack(refs_t, dim=0).to(self.device)  # [B,4,H,W]
-
+                x_ref_t = torch.stack(refs_t, dim=0).to(self.device)       # [B,4,H,W]
                 s_t = self.style_encoder_ema(x_ref_t, y_tgt)
                 x_fake = self.generator_ema(x_src, s_t, y_org=y_src, c_t=y_tgt)
 
                 x_fake_den = self.denorm(x_fake)
-                x_tgt_den = self.denorm(x_tgt)
-                x_src_den = self.denorm(x_src)
+                x_tgt_den  = self.denorm(x_tgt)
+                x_src_den  = self.denorm(x_src)
 
-                mae_f = torch.abs(x_fake_den - x_tgt_den).view(B, -1).mean(dim=1).sum().item()
+                mae_f  = torch.abs(x_fake_den - x_tgt_den).view(B, -1).mean(dim=1).sum().item()
                 psnr_f = _psnr(x_fake_den, x_tgt_den).sum().item()
                 ssim_f = ssim_fn(x_fake_den, x_tgt_den).sum().item()
-                kl_f = _sym_kl_hist(x_fake_den, x_tgt_den, bins=kl_bins).sum().item()
+                kl_f   = _sym_kl_hist(x_fake_den, x_tgt_den, bins=kl_bins).sum().item()
 
                 if key_fwd not in tot:
                     tot[key_fwd] = {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
-                tot[key_fwd]["mae"] += mae_f
-                tot[key_fwd]["psnr"] += psnr_f
-                tot[key_fwd]["ssim"] += ssim_f
-                tot[key_fwd]["kl"] += kl_f
+                tot[key_fwd]["mae"]   += mae_f
+                tot[key_fwd]["psnr"]  += psnr_f
+                tot[key_fwd]["ssim"]  += ssim_f
+                tot[key_fwd]["kl"]    += kl_f
                 tot[key_fwd]["count"] += B
 
-                # save 4-panel and single fake (forward)
-                b0 = 0
-                src_rgb = self.rggb2rgb(x_src_den[b0])
-                ref_rgb = self.rggb2rgb(self.denorm(x_ref_t)[b0])
-                fake_rgb = self.rggb2rgb(x_fake_den[b0])
-                tgt_rgb = self.rggb2rgb(x_tgt_den[b0])
-                panel = torch.stack([src_rgb, ref_rgb, fake_rgb, tgt_rgb], 0)
-                save_image(panel, os.path.join(trip_dir, f"{src}2{tgt}_batch{batch_i}.png"), nrow=4)
-                os.makedirs(os.path.join(fake_root, tgt), exist_ok=True)
-                save_image(fake_rgb, os.path.join(fake_root, tgt, f"{src}2{tgt}_batch{batch_i}_fake.png"))
+                # 可视化保存（仅 eval）｜save visual only in eval
+                if save_vis:
+                    b0 = 0
+                    src_rgb  = self.rggb2rgb(x_src_den[b0])
+                    ref_rgb  = self.rggb2rgb(self.denorm(x_ref_t)[b0])
+                    fake_rgb = self.rggb2rgb(x_fake_den[b0])
+                    tgt_rgb  = self.rggb2rgb(x_tgt_den[b0])
+                    panel = torch.stack([src_rgb, ref_rgb, fake_rgb, tgt_rgb], 0)
+                    save_image(panel, os.path.join(trip_dir, f"{src}2{tgt}_batch{batch_i}.png"), nrow=4)
+                    os.makedirs(os.path.join(fake_root, tgt), exist_ok=True)
+                    save_image(fake_rgb, os.path.join(fake_root, tgt, f"{src}2{tgt}_batch{batch_i}_fake.png"))
 
             # ---------- reverse: tgt -> src (ref from TEST src by brightness) ----------
             do_reverse = True
             refs_s = []
             for b in range(B):
                 tvec = self._channel_means(x_src[b])
-                ref = self._select_ref_by_cmeans(src, tvec, base_names[b])
+                ref  = self._select_ref_by_cmeans(src, tvec, base_names[b])
                 if ref is None:
                     if B > 1:
                         ref = x_src[(b + 1) % B].detach()
@@ -523,69 +528,69 @@ class Solver(nn.Module):
                 refs_s.append(ref)
             if do_reverse:
                 x_ref_s = torch.stack(refs_s, dim=0).to(self.device)
-
                 s_s = self.style_encoder_ema(x_ref_s, y_src)
                 x_fake_rev = self.generator_ema(x_tgt, s_s, y_org=y_tgt, c_t=y_src)
 
                 x_fake_rev_den = self.denorm(x_fake_rev)
                 x_src_den = self.denorm(x_src)
 
-                mae_r = torch.abs(x_fake_rev_den - x_src_den).view(B, -1).mean(dim=1).sum().item()
+                mae_r  = torch.abs(x_fake_rev_den - x_src_den).view(B, -1).mean(dim=1).sum().item()
                 psnr_r = _psnr(x_fake_rev_den, x_src_den).sum().item()
                 ssim_r = ssim_fn(x_fake_rev_den, x_src_den).sum().item()
-                kl_r = _sym_kl_hist(x_fake_rev_den, x_src_den, bins=kl_bins).sum().item()
+                kl_r   = _sym_kl_hist(x_fake_rev_den, x_src_den, bins=kl_bins).sum().item()
 
                 if key_rev not in tot:
                     tot[key_rev] = {"mae": 0.0, "psnr": 0.0, "ssim": 0.0, "kl": 0.0, "count": 0}
-                tot[key_rev]["mae"] += mae_r
-                tot[key_rev]["psnr"] += psnr_r
-                tot[key_rev]["ssim"] += ssim_r
-                tot[key_rev]["kl"] += kl_r
+                tot[key_rev]["mae"]   += mae_r
+                tot[key_rev]["psnr"]  += psnr_r
+                tot[key_rev]["ssim"]  += ssim_r
+                tot[key_rev]["kl"]    += kl_r
                 tot[key_rev]["count"] += B
 
-                # save 4-panel and single fake (reverse)
-                tgt_rgb_r = self.rggb2rgb(self.denorm(x_tgt)[b0])
-                ref_rev_rgb = self.rggb2rgb(self.denorm(x_ref_s)[b0])
-                fake_rev_rgb = self.rggb2rgb(x_fake_rev_den[b0])
-                src_rgb_r = self.rggb2rgb(self.denorm(x_src)[b0])
-                panel_r = torch.stack([tgt_rgb_r, ref_rev_rgb, fake_rev_rgb, src_rgb_r], 0)
-                save_image(panel_r, os.path.join(trip_dir, f"{tgt}2{src}_batch{batch_i}.png"), nrow=4)
-                os.makedirs(os.path.join(fake_root, src), exist_ok=True)
-                save_image(fake_rev_rgb, os.path.join(fake_root, src, f"{tgt}2{src}_batch{batch_i}_fake.png"))
+                if save_vis:
+                    b0 = 0
+                    tgt_rgb_r    = self.rggb2rgb(self.denorm(x_tgt)[b0])
+                    ref_rev_rgb  = self.rggb2rgb(self.denorm(x_ref_s)[b0])
+                    fake_rev_rgb = self.rggb2rgb(x_fake_rev_den[b0])
+                    src_rgb_r    = self.rggb2rgb(self.denorm(x_src)[b0])
+                    panel_r = torch.stack([tgt_rgb_r, ref_rev_rgb, fake_rev_rgb, src_rgb_r], 0)
+                    save_image(panel_r, os.path.join(trip_dir, f"{tgt}2{src}_batch{batch_i}.png"), nrow=4)
+                    os.makedirs(os.path.join(fake_root, src), exist_ok=True)
+                    save_image(fake_rev_rgb, os.path.join(fake_root, src, f"{tgt}2{src}_batch{batch_i}_fake.png"))
 
-        # ---- per-direction report ----
+        # ---- per-direction report｜逐方向统计 ----
         for key, v in tot.items():
             cnt = max(1, v["count"])
-            print(f"{key}  MAE:{v['mae'] / cnt:.4f} PSNR:{v['psnr'] / cnt:.2f} "
-                  f"SSIM:{v['ssim'] / cnt:.4f} KL:{v['kl'] / cnt:.6f}")
+            print(f"{key}  MAE:{v['mae']/cnt:.4f} PSNR:{v['psnr']/cnt:.2f} "
+                f"SSIM:{v['ssim']/cnt:.4f} KL:{v['kl']/cnt:.6f}")
 
-        # ---- micro-average over all ----
-        total_mae = sum(v["mae"] for v in tot.values())
+        # ---- micro-average over all｜总体平均 ----
+        total_mae  = sum(v["mae"]  for v in tot.values())
         total_psnr = sum(v["psnr"] for v in tot.values())
         total_ssim = sum(v["ssim"] for v in tot.values())
-        total_kl = sum(v["kl"] for v in tot.values())
-        total_cnt = sum(v["count"] for v in tot.values())
+        total_kl   = sum(v["kl"]   for v in tot.values())
+        total_cnt  = sum(v["count"] for v in tot.values())
 
-        avg_mae = total_mae / total_cnt if total_cnt > 0 else float('nan')
+        avg_mae  = total_mae / total_cnt if total_cnt > 0 else float('nan')
         avg_psnr = total_psnr / total_cnt if total_cnt > 0 else float('nan')
         avg_ssim = total_ssim / total_cnt if total_cnt > 0 else float('nan')
-        avg_kl = total_kl / total_cnt if total_cnt > 0 else float('nan')
+        avg_kl   = total_kl   / total_cnt if total_cnt > 0 else float('nan')
 
         print(f"Avg all  MAE:{avg_mae:.4f} PSNR:{avg_psnr:.2f} SSIM:{avg_ssim:.4f} KL:{avg_kl:.6f}")
 
-        # ---- wandb ----
+        # ---- wandb logging (metrics only)｜仅记录指标 ----
         if self.args.use_wandb:
             metrics = {}
             for key, v in tot.items():
                 cnt = max(1, v["count"])
-                metrics[f"{key}/MAE"] = v["mae"] / cnt
+                metrics[f"{key}/MAE"]  = v["mae"]  / cnt
                 metrics[f"{key}/PSNR"] = v["psnr"] / cnt
                 metrics[f"{key}/SSIM"] = v["ssim"] / cnt
-                metrics[f"{key}/KL"] = v["kl"] / cnt
-            metrics["Avg/MAE"] = avg_mae
+                metrics[f"{key}/KL"]   = v["kl"]   / cnt
+            metrics["Avg/MAE"]  = avg_mae
             metrics["Avg/PSNR"] = avg_psnr
             metrics["Avg/SSIM"] = avg_ssim
-            metrics["Avg/KL"] = avg_kl
+            metrics["Avg/KL"]   = avg_kl
             wandb.log(metrics, step=step)
 
         return avg_mae
